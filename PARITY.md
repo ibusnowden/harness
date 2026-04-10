@@ -3,7 +3,6 @@
 ## Summary
 
 - The active runtime is the Go `ascaris` CLI.
-- Historical Rust and Python migration material has been archived under `legacy/`.
 - Go-side traceability and contract checks are fixture-backed through `testdata/parity/traceability.json` and `testdata/contracts/`.
 
 ## Live Go Surface
@@ -18,11 +17,3 @@
 
 - `./bin/ascaris parity-audit` checks mapped root files and directories against the active Go tree and reports live registry counts.
 - `testdata/contracts/mock_parity_scenarios.json` keeps the scripted scenario manifest used by the Go-side harness tests.
-
-## Archived Material
-
-- Historical Rust parity writeups: `legacy/rust/PARITY.md`
-- Historical Rust workspace: `legacy/rust/`
-- Historical Python workspace: `legacy/src/`
-
-The archive remains tracked for reference, but it is no longer part of the active build, test, or documentation path.

@@ -6,8 +6,6 @@ on:
       - main
       - 'gaebal/**'
       - 'omx-issue-*'
-    paths-ignore:
-      - 'legacy/**'
   workflow_dispatch:
 
 concurrency:

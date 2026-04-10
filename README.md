@@ -2,7 +2,7 @@
 
 Ascaris is a Go coding harness built for local CLI use, standalone binaries, and a future `curl | sh` install flow.
 
-The active product is the Go CLI under [`cmd/ascaris`](./cmd/ascaris). Archived Rust and Python migration material lives under [`legacy/`](./legacy) and is no longer part of the active build, test, or documentation path.
+The active product is the Go CLI under [`cmd/ascaris`](./cmd/ascaris).
 
 ## Active Repo Shape
 
@@ -10,7 +10,6 @@ The active product is the Go CLI under [`cmd/ascaris`](./cmd/ascaris). Archived 
 - `internal/` — Go packages for CLI, runtime, sessions, tools, plugins, MCP, OAuth, recovery, and state
 - `testdata/parity/traceability.json` — traceability fixture for Go audit coverage
 - `testdata/contracts` — scenario and contract fixtures for the Go test suite
-- `legacy/` — archived Rust, Python, and historical migration material
 
 ## Quick Start
 

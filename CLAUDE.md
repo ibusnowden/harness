@@ -13,7 +13,6 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Repository shape
 - `cmd/ascaris` contains the executable entrypoint.
 - `internal/` contains the active Go implementation.
-- `legacy/` contains archived Rust/Python migration material and historical references.
 
 ## Working agreement
 - Prefer small, reviewable changes and keep generated bootstrap files aligned with actual repo workflows.

@@ -87,4 +87,3 @@ go test ./...
 - Docker and Podman use the same `Containerfile`.
 - The `:Z` suffix in the Podman examples is for SELinux relabeling.
 - `GOCACHE=/tmp/go-build` keeps build artifacts out of the mounted checkout.
-- Historical Rust container workflows are archived with the rest of the legacy tree under `legacy/`.

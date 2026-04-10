@@ -6,13 +6,9 @@ on:
       - main
       - 'gaebal/**'
       - 'omx-issue-*'
-    paths-ignore:
-      - 'legacy/**'
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - 'legacy/**'
   workflow_dispatch:
 
 concurrency:

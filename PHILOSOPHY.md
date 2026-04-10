@@ -9,7 +9,7 @@ The product goal is straightforward:
 - make prompt execution, tools, sessions, recovery, and operator controls scriptable
 - ship one active implementation language and one active product name
 
-The repo reflects that bias. The active surface is the Go CLI. Historical migrations are archived, not presented as current product code.
+The repo reflects that bias. The active surface is the Go CLI.
 
 What matters here is operational clarity:
 
