@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 
 	"ascaris/internal/api"
@@ -280,7 +281,7 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 			return liveError(call, "bash denied by user approval prompt")
 		}
 	}
-	command := exec.Command("zsh", "-lc", input.Command)
+	command := shellCommand(input.Command)
 	command.Dir = ctx.Root
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -310,6 +311,13 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 		}
 	}
 	return liveJSON(call, output)
+}
+
+func shellCommand(command string) *exec.Cmd {
+	if runtime.GOOS == "windows" {
+		return exec.Command("cmd", "/C", command)
+	}
+	return exec.Command("sh", "-lc", command)
 }
 
 func resolveWorkspacePath(root, path string) (string, error) {
