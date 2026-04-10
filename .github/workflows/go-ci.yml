@@ -1,0 +1,107 @@
+name: Go CI
+
+on:
+  push:
+    branches:
+      - main
+      - 'gaebal/**'
+      - 'omx-issue-*'
+    paths-ignore:
+      - 'legacy/**'
+  pull_request:
+    branches:
+      - main
+    paths-ignore:
+      - 'legacy/**'
+  workflow_dispatch:
+
+concurrency:
+  group: go-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  doc-source-of-truth:
+    name: docs source-of-truth
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Check docs and metadata for stale branding
+        run: python .github/scripts/check_doc_source_of_truth.py
+
+  fmt:
+    name: gofmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Check formatting
+        shell: bash
+        run: |
+          files="$(find cmd internal -name '*.go' -print)"
+          output="$(gofmt -l $files)"
+          if [ -n "$output" ]; then
+            echo "$output"
+            exit 1
+          fi
+
+  vet:
+    name: go vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run go vet
+        run: go vet ./...
+
+  test:
+    name: go test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run Go test suite
+        run: |
+          mkdir -p .cache/go-build
+          GOCACHE="$(pwd)/.cache/go-build" go test ./...
+
+  build:
+    name: build-${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build ascaris
+        run: go build -o ./bin/ascaris ./cmd/ascaris
+
+  install-smoke:
+    name: install smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run installer smoke test
+        run: ./install.sh

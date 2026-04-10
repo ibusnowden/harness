@@ -1,0 +1,61 @@
+name: Dev Artifacts
+
+on:
+  push:
+    branches:
+      - main
+      - 'gaebal/**'
+      - 'omx-issue-*'
+    paths-ignore:
+      - 'legacy/**'
+  workflow_dispatch:
+
+concurrency:
+  group: dev-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  snapshot-binaries:
+    name: snapshot-${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build snapshot binary
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          mkdir -p dist
+          go build -trimpath -o "./dist/ascaris-${{ matrix.target }}" ./cmd/ascaris
+      - name: Package snapshot artifact
+        run: |
+          mkdir -p artifacts
+          cp "./dist/ascaris-${{ matrix.target }}" ./artifacts/ascaris
+          chmod +x ./artifacts/ascaris
+          tar -C artifacts -czf "./dist/ascaris-${{ matrix.target }}.tar.gz" ascaris
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ascaris-${{ matrix.target }}
+          path: ./dist/ascaris-${{ matrix.target }}.tar.gz
