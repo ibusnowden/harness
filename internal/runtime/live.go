@@ -89,12 +89,13 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		return PromptSummary{}, err
 	}
 	client, err := api.NewProviderClient(resolveModel(opts.Model), api.ProviderConfig{
-		AnthropicBaseURL: h.Config.ProviderSettings().AnthropicBaseURL,
-		OpenAIBaseURL:    h.Config.ProviderSettings().OpenAIBaseURL,
-		XAIBaseURL:       h.Config.ProviderSettings().XAIBaseURL,
-		ProxyURL:         h.Config.ProviderSettings().ProxyURL,
-		ConfigHome:       config.ConfigHome(h.Root),
-		OAuthSettings:    h.Config.OAuth(),
+		AnthropicBaseURL:  h.Config.ProviderSettings().AnthropicBaseURL,
+		OpenAIBaseURL:     h.Config.ProviderSettings().OpenAIBaseURL,
+		OpenRouterBaseURL: h.Config.ProviderSettings().OpenRouterBaseURL,
+		XAIBaseURL:        h.Config.ProviderSettings().XAIBaseURL,
+		ProxyURL:          h.Config.ProviderSettings().ProxyURL,
+		ConfigHome:        config.ConfigHome(h.Root),
+		OAuthSettings:     h.Config.OAuth(),
 	})
 	if err != nil {
 		return PromptSummary{}, err

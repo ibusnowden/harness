@@ -82,6 +82,148 @@ func TestProviderClientRoutesGrokThroughXAI(t *testing.T) {
 	}
 }
 
+func TestProviderClientRoutesOpenRouterSlugsThroughOpenAICompat(t *testing.T) {
+	transport := &captureTransport{
+		status:      200,
+		contentType: "text/event-stream",
+		body: strings.Join([]string{
+			`data: {"id":"chatcmpl_test","model":"openai/gpt-4.1-mini","choices":[{"delta":{"content":"Hello from OpenRouter"}}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n"),
+	}
+	restore := SetTransportForTesting(transport)
+	defer restore()
+	t.Setenv("OPENROUTER_API_KEY", "openrouter-test-key")
+	t.Setenv("OPENROUTER_BASE_URL", "https://openrouter.example/v1")
+
+	client, err := NewProviderClient("openai/gpt-4.1-mini", ProviderConfig{})
+	if err != nil {
+		t.Fatalf("new provider client: %v", err)
+	}
+	response, err := client.StreamMessage(context.Background(), MessageRequest{
+		Model:     "openai/gpt-4.1-mini",
+		MaxTokens: 256,
+		Messages:  []InputMessage{UserTextMessage("hello")},
+	})
+	if err != nil {
+		t.Fatalf("stream message: %v", err)
+	}
+	if client.ProviderKind() != ProviderOpenRouter {
+		t.Fatalf("unexpected provider kind: %s", client.ProviderKind())
+	}
+	if response.FinalText() != "Hello from OpenRouter" {
+		t.Fatalf("unexpected response text: %q", response.FinalText())
+	}
+	if transport.lastRequest == nil || transport.lastRequest.URL.String() != "https://openrouter.example/v1/chat/completions" {
+		t.Fatalf("unexpected request url: %#v", transport.lastRequest)
+	}
+	if got := transport.lastRequest.Header.Get("authorization"); got != "Bearer openrouter-test-key" {
+		t.Fatalf("unexpected auth header: %q", got)
+	}
+}
+
+func TestProviderClientPrefersOpenRouterForSlashGrokModels(t *testing.T) {
+	transport := &captureTransport{
+		status:      200,
+		contentType: "text/event-stream",
+		body: strings.Join([]string{
+			`data: {"id":"chatcmpl_test","model":"x-ai/grok-3-mini","choices":[{"delta":{"content":"Hello from OpenRouter Grok"}}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[],"usage":{"prompt_tokens":9,"completion_tokens":4}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n"),
+	}
+	restore := SetTransportForTesting(transport)
+	defer restore()
+	t.Setenv("OPENROUTER_API_KEY", "openrouter-test-key")
+	t.Setenv("OPENROUTER_BASE_URL", "https://openrouter.example/v1")
+	t.Setenv("XAI_API_KEY", "xai-test-key")
+	t.Setenv("XAI_BASE_URL", "https://xai.example/v1")
+
+	client, err := NewProviderClient("x-ai/grok-3-mini", ProviderConfig{})
+	if err != nil {
+		t.Fatalf("new provider client: %v", err)
+	}
+	response, err := client.StreamMessage(context.Background(), MessageRequest{
+		Model:     "x-ai/grok-3-mini",
+		MaxTokens: 256,
+		Messages:  []InputMessage{UserTextMessage("hello")},
+	})
+	if err != nil {
+		t.Fatalf("stream message: %v", err)
+	}
+	if client.ProviderKind() != ProviderOpenRouter {
+		t.Fatalf("unexpected provider kind: %s", client.ProviderKind())
+	}
+	if response.FinalText() != "Hello from OpenRouter Grok" {
+		t.Fatalf("unexpected response text: %q", response.FinalText())
+	}
+	if transport.lastRequest == nil || transport.lastRequest.URL.String() != "https://openrouter.example/v1/chat/completions" {
+		t.Fatalf("unexpected request url: %#v", transport.lastRequest)
+	}
+	if got := transport.lastRequest.Header.Get("authorization"); got != "Bearer openrouter-test-key" {
+		t.Fatalf("unexpected auth header: %q", got)
+	}
+}
+
+func TestProviderClientKeepsDirectOpenAIPathForPlainModels(t *testing.T) {
+	transport := &captureTransport{
+		status:      200,
+		contentType: "text/event-stream",
+		body: strings.Join([]string{
+			`data: {"id":"chatcmpl_test","model":"gpt-4.1-mini","choices":[{"delta":{"content":"Hello from OpenAI"}}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[],"usage":{"prompt_tokens":8,"completion_tokens":3}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n"),
+	}
+	restore := SetTransportForTesting(transport)
+	defer restore()
+	t.Setenv("OPENAI_API_KEY", "openai-test-key")
+	t.Setenv("OPENAI_BASE_URL", "https://openai.example/v1")
+	t.Setenv("OPENROUTER_API_KEY", "openrouter-test-key")
+	t.Setenv("OPENROUTER_BASE_URL", "https://openrouter.example/v1")
+
+	client, err := NewProviderClient("gpt-4.1-mini", ProviderConfig{})
+	if err != nil {
+		t.Fatalf("new provider client: %v", err)
+	}
+	response, err := client.StreamMessage(context.Background(), MessageRequest{
+		Model:     "gpt-4.1-mini",
+		MaxTokens: 256,
+		Messages:  []InputMessage{UserTextMessage("hello")},
+	})
+	if err != nil {
+		t.Fatalf("stream message: %v", err)
+	}
+	if client.ProviderKind() != ProviderOpenAI {
+		t.Fatalf("unexpected provider kind: %s", client.ProviderKind())
+	}
+	if response.FinalText() != "Hello from OpenAI" {
+		t.Fatalf("unexpected response text: %q", response.FinalText())
+	}
+	if transport.lastRequest == nil || transport.lastRequest.URL.String() != "https://openai.example/v1/chat/completions" {
+		t.Fatalf("unexpected request url: %#v", transport.lastRequest)
+	}
+	if got := transport.lastRequest.Header.Get("authorization"); got != "Bearer openai-test-key" {
+		t.Fatalf("unexpected auth header: %q", got)
+	}
+}
+
 func TestProviderClientReportsMissingXAIKey(t *testing.T) {
 	t.Setenv("XAI_API_KEY", "")
 	if _, err := NewProviderClient("grok-3", ProviderConfig{}); err == nil || !strings.Contains(err.Error(), "XAI_API_KEY") {

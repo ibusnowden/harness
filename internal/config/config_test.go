@@ -88,3 +88,29 @@ func TestLoadParsesHooksOAuthAndMCPSettings(t *testing.T) {
 		t.Fatalf("unexpected remote server: %#v", servers["remote"])
 	}
 }
+
+func TestLoadParsesOpenRouterProviderSettings(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, ".ascaris"), 0o755); err != nil {
+		t.Fatalf("mkdir project config: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(root, ".ascaris", "settings.json"), []byte(`{
+  "provider": {
+    "openrouterBaseURL": "https://openrouter.example/v1",
+    "openaiBaseURL": "https://openai.example/v1"
+  }
+}`), 0o644); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
+	loaded, err := Load(root)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	settings := loaded.ProviderSettings()
+	if settings.OpenRouterBaseURL != "https://openrouter.example/v1" {
+		t.Fatalf("unexpected openrouter base url: %#v", settings)
+	}
+	if settings.OpenAIBaseURL != "https://openai.example/v1" {
+		t.Fatalf("unexpected openai base url: %#v", settings)
+	}
+}

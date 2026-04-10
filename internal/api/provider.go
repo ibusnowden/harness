@@ -15,18 +15,20 @@ import (
 type ProviderKind string
 
 const (
-	ProviderAnthropic ProviderKind = "anthropic"
-	ProviderOpenAI    ProviderKind = "openai"
-	ProviderXAI       ProviderKind = "xai"
+	ProviderAnthropic  ProviderKind = "anthropic"
+	ProviderOpenAI     ProviderKind = "openai"
+	ProviderOpenRouter ProviderKind = "openrouter"
+	ProviderXAI        ProviderKind = "xai"
 )
 
 type ProviderConfig struct {
-	AnthropicBaseURL string
-	OpenAIBaseURL    string
-	XAIBaseURL       string
-	ProxyURL         string
-	ConfigHome       string
-	OAuthSettings    *config.OAuthSettings
+	AnthropicBaseURL  string
+	OpenAIBaseURL     string
+	OpenRouterBaseURL string
+	XAIBaseURL        string
+	ProxyURL          string
+	ConfigHome        string
+	OAuthSettings     *config.OAuthSettings
 }
 
 type MessageClient interface {
@@ -40,6 +42,8 @@ func ConfiguredFromEnv() bool {
 		"ANTHROPIC_BASE_URL",
 		"OPENAI_API_KEY",
 		"OPENAI_BASE_URL",
+		"OPENROUTER_API_KEY",
+		"OPENROUTER_BASE_URL",
 		"XAI_API_KEY",
 		"XAI_BASE_URL",
 	} {
@@ -51,7 +55,7 @@ func ConfiguredFromEnv() bool {
 }
 
 func NewProviderClient(model string, cfg ProviderConfig) (MessageClient, error) {
-	switch providerKindForModel(model) {
+	switch providerKindForModel(model, cfg) {
 	case ProviderXAI:
 		apiKey := strings.TrimSpace(os.Getenv("XAI_API_KEY"))
 		if apiKey == "" {
@@ -60,6 +64,18 @@ func NewProviderClient(model string, cfg ProviderConfig) (MessageClient, error) 
 		baseURL := firstNonEmpty(strings.TrimSpace(os.Getenv("XAI_BASE_URL")), cfg.XAIBaseURL, "https://api.x.ai/v1")
 		return &OpenAICompatClient{
 			kind:       ProviderXAI,
+			baseURL:    baseURL,
+			apiKey:     apiKey,
+			httpClient: newHTTPClient(cfg.ProxyURL),
+		}, nil
+	case ProviderOpenRouter:
+		apiKey := strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY"))
+		if apiKey == "" {
+			return nil, fmt.Errorf("OPENROUTER_API_KEY is required for OpenRouter models")
+		}
+		baseURL := firstNonEmpty(strings.TrimSpace(os.Getenv("OPENROUTER_BASE_URL")), cfg.OpenRouterBaseURL, "https://openrouter.ai/api/v1")
+		return &OpenAICompatClient{
+			kind:       ProviderOpenRouter,
 			baseURL:    baseURL,
 			apiKey:     apiKey,
 			httpClient: newHTTPClient(cfg.ProxyURL),
@@ -112,9 +128,11 @@ func NewAnthropicClient(ctx context.Context, cfg ProviderConfig) (*Client, error
 	return nil, fmt.Errorf("ANTHROPIC_API_KEY or saved OAuth credentials are required for Anthropic models")
 }
 
-func providerKindForModel(model string) ProviderKind {
+func providerKindForModel(model string, cfg ProviderConfig) ProviderKind {
 	normalized := strings.ToLower(strings.TrimSpace(model))
 	switch {
+	case shouldUseOpenRouter(normalized, cfg):
+		return ProviderOpenRouter
 	case strings.Contains(normalized, "grok"):
 		return ProviderXAI
 	case strings.HasPrefix(normalized, "gpt"), strings.HasPrefix(normalized, "o1"), strings.HasPrefix(normalized, "o3"), strings.HasPrefix(normalized, "o4"):
@@ -122,6 +140,19 @@ func providerKindForModel(model string) ProviderKind {
 	default:
 		return ProviderAnthropic
 	}
+}
+
+func shouldUseOpenRouter(model string, cfg ProviderConfig) bool {
+	if !openRouterConfigured(cfg) {
+		return false
+	}
+	return strings.Contains(model, "/")
+}
+
+func openRouterConfigured(cfg ProviderConfig) bool {
+	return strings.TrimSpace(os.Getenv("OPENROUTER_API_KEY")) != "" ||
+		strings.TrimSpace(os.Getenv("OPENROUTER_BASE_URL")) != "" ||
+		strings.TrimSpace(cfg.OpenRouterBaseURL) != ""
 }
 
 func firstNonEmpty(values ...string) string {

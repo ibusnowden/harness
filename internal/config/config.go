@@ -27,10 +27,11 @@ type RuntimeConfig struct {
 }
 
 type ProviderSettings struct {
-	AnthropicBaseURL string
-	OpenAIBaseURL    string
-	XAIBaseURL       string
-	ProxyURL         string
+	AnthropicBaseURL  string
+	OpenAIBaseURL     string
+	OpenRouterBaseURL string
+	XAIBaseURL        string
+	ProxyURL          string
 }
 
 type PluginSettings struct {
@@ -134,6 +135,11 @@ func (c RuntimeConfig) ProviderSettings() ProviderSettings {
 		OpenAIBaseURL: firstNonEmpty(
 			stringAtMap(provider, "openaiBaseURL"),
 			stringAtMap(provider, "openai_base_url"),
+		),
+		OpenRouterBaseURL: firstNonEmpty(
+			stringAtMap(provider, "openRouterBaseURL"),
+			stringAtMap(provider, "openrouterBaseURL"),
+			stringAtMap(provider, "openrouter_base_url"),
 		),
 		XAIBaseURL: firstNonEmpty(
 			stringAtMap(provider, "xaiBaseURL"),
