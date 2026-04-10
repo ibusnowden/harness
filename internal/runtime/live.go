@@ -20,6 +20,7 @@ import (
 
 type PromptOptions struct {
 	Model                  string
+	Provider               api.ProviderKind
 	PermissionMode         tools.PermissionMode
 	AllowedTools           []string
 	ResumeSession          string
@@ -92,6 +93,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		AnthropicBaseURL:  h.Config.ProviderSettings().AnthropicBaseURL,
 		OpenAIBaseURL:     h.Config.ProviderSettings().OpenAIBaseURL,
 		OpenRouterBaseURL: h.Config.ProviderSettings().OpenRouterBaseURL,
+		PreferredProvider: opts.Provider,
 		XAIBaseURL:        h.Config.ProviderSettings().XAIBaseURL,
 		ProxyURL:          h.Config.ProviderSettings().ProxyURL,
 		ConfigHome:        config.ConfigHome(h.Root),
@@ -382,6 +384,11 @@ func withPromptDefaults(opts PromptOptions, runtimeConfig config.RuntimeConfig) 
 	}
 	if strings.TrimSpace(opts.Model) == "" {
 		opts.Model = defaults.Model
+	}
+	if opts.Provider == "" {
+		if provider, err := api.ParseProviderKind(runtimeConfig.ProviderSettings().Kind); err == nil {
+			opts.Provider = provider
+		}
 	}
 	if opts.PermissionMode == "" {
 		opts.PermissionMode = tools.PermissionMode(runtimeConfig.PermissionMode())

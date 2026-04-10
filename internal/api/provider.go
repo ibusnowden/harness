@@ -25,6 +25,7 @@ type ProviderConfig struct {
 	AnthropicBaseURL  string
 	OpenAIBaseURL     string
 	OpenRouterBaseURL string
+	PreferredProvider ProviderKind
 	XAIBaseURL        string
 	ProxyURL          string
 	ConfigHome        string
@@ -97,6 +98,18 @@ func NewProviderClient(model string, cfg ProviderConfig) (MessageClient, error) 
 	}
 }
 
+func ParseProviderKind(raw string) (ProviderKind, error) {
+	normalized := ProviderKind(strings.ToLower(strings.TrimSpace(raw)))
+	switch normalized {
+	case "":
+		return "", nil
+	case ProviderAnthropic, ProviderOpenAI, ProviderOpenRouter, ProviderXAI:
+		return normalized, nil
+	default:
+		return "", fmt.Errorf("unsupported provider: %s", raw)
+	}
+}
+
 func NewAnthropicClientFromEnv(cfg ProviderConfig) (*Client, error) {
 	return NewAnthropicClient(context.Background(), cfg)
 }
@@ -129,6 +142,9 @@ func NewAnthropicClient(ctx context.Context, cfg ProviderConfig) (*Client, error
 }
 
 func providerKindForModel(model string, cfg ProviderConfig) ProviderKind {
+	if cfg.PreferredProvider != "" {
+		return cfg.PreferredProvider
+	}
 	normalized := strings.ToLower(strings.TrimSpace(model))
 	switch {
 	case shouldUseOpenRouter(normalized, cfg):

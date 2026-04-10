@@ -96,6 +96,7 @@ func TestLoadParsesOpenRouterProviderSettings(t *testing.T) {
 	}
 	if err := os.WriteFile(filepath.Join(root, ".ascaris", "settings.json"), []byte(`{
   "provider": {
+    "kind": "openai",
     "openrouterBaseURL": "https://openrouter.example/v1",
     "openaiBaseURL": "https://openai.example/v1"
   }
@@ -112,5 +113,8 @@ func TestLoadParsesOpenRouterProviderSettings(t *testing.T) {
 	}
 	if settings.OpenAIBaseURL != "https://openai.example/v1" {
 		t.Fatalf("unexpected openai base url: %#v", settings)
+	}
+	if settings.Kind != "openai" {
+		t.Fatalf("unexpected provider kind: %#v", settings)
 	}
 }

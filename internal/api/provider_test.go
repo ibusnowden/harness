@@ -224,6 +224,52 @@ func TestProviderClientKeepsDirectOpenAIPathForPlainModels(t *testing.T) {
 	}
 }
 
+func TestProviderClientAllowsExplicitOpenAIOverrideForLocalCompatModels(t *testing.T) {
+	transport := &captureTransport{
+		status:      200,
+		contentType: "text/event-stream",
+		body: strings.Join([]string{
+			`data: {"id":"chatcmpl_test","model":"GLM-4.7-Flash","choices":[{"delta":{"content":"Hello from local compat"}}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":4}}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n"),
+	}
+	restore := SetTransportForTesting(transport)
+	defer restore()
+	t.Setenv("OPENAI_API_KEY", "openai-test-key")
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1")
+
+	client, err := NewProviderClient("GLM-4.7-Flash", ProviderConfig{PreferredProvider: ProviderOpenAI})
+	if err != nil {
+		t.Fatalf("new provider client: %v", err)
+	}
+	response, err := client.StreamMessage(context.Background(), MessageRequest{
+		Model:     "GLM-4.7-Flash",
+		MaxTokens: 256,
+		Messages:  []InputMessage{UserTextMessage("hello")},
+	})
+	if err != nil {
+		t.Fatalf("stream message: %v", err)
+	}
+	if client.ProviderKind() != ProviderOpenAI {
+		t.Fatalf("unexpected provider kind: %s", client.ProviderKind())
+	}
+	if response.FinalText() != "Hello from local compat" {
+		t.Fatalf("unexpected response text: %q", response.FinalText())
+	}
+	if transport.lastRequest == nil || transport.lastRequest.URL.String() != "http://127.0.0.1:8000/v1/chat/completions" {
+		t.Fatalf("unexpected request url: %#v", transport.lastRequest)
+	}
+	if !strings.Contains(transport.lastBody, `"model":"GLM-4.7-Flash"`) {
+		t.Fatalf("expected raw model name in request body: %s", transport.lastBody)
+	}
+}
+
 func TestProviderClientReportsMissingXAIKey(t *testing.T) {
 	t.Setenv("XAI_API_KEY", "")
 	if _, err := NewProviderClient("grok-3", ProviderConfig{}); err == nil || !strings.Contains(err.Error(), "XAI_API_KEY") {

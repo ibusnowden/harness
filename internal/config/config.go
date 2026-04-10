@@ -30,6 +30,7 @@ type ProviderSettings struct {
 	AnthropicBaseURL  string
 	OpenAIBaseURL     string
 	OpenRouterBaseURL string
+	Kind              string
 	XAIBaseURL        string
 	ProxyURL          string
 }
@@ -140,6 +141,11 @@ func (c RuntimeConfig) ProviderSettings() ProviderSettings {
 			stringAtMap(provider, "openRouterBaseURL"),
 			stringAtMap(provider, "openrouterBaseURL"),
 			stringAtMap(provider, "openrouter_base_url"),
+		),
+		Kind: firstNonEmpty(
+			stringAtMap(provider, "kind"),
+			stringAtMap(provider, "providerKind"),
+			stringAt(c.merged, "provider"),
 		),
 		XAIBaseURL: firstNonEmpty(
 			stringAtMap(provider, "xaiBaseURL"),

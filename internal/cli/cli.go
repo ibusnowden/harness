@@ -32,6 +32,7 @@ import (
 	"ascaris/internal/pool"
 	"ascaris/internal/query"
 	hruntime "ascaris/internal/runtime"
+	"ascaris/internal/securityreview"
 	"ascaris/internal/sessions"
 	"ascaris/internal/setup"
 	"ascaris/internal/skills"
@@ -48,6 +49,7 @@ type Context struct {
 
 type globalOptions struct {
 	Model          string
+	Provider       api.ProviderKind
 	PermissionMode tools.PermissionMode
 	AllowedTools   []string
 	OutputFormat   string
@@ -93,6 +95,12 @@ func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return runStatus(ctx, remaining[1:], stdout, stderr)
 	case "doctor":
 		return runDoctor(ctx, remaining[1:], stdout, stderr)
+	case "review":
+		return runDefensiveReview(ctx, securityreview.ModeReview, remaining[1:], stdout, stderr)
+	case "security-review":
+		return runDefensiveReview(ctx, securityreview.ModeSecurityReview, remaining[1:], stdout, stderr)
+	case "bughunter":
+		return runDefensiveReview(ctx, securityreview.ModeBugHunter, remaining[1:], stdout, stderr)
 	case "sandbox":
 		_, _ = fmt.Fprintln(stdout, "mode=workspace-write\nfilesystem=.ascaris-aware\nnetwork=local-only")
 		return 0
@@ -229,6 +237,38 @@ func runDoctor(ctx Context, args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	_, _ = fmt.Fprintln(stdout, report.Text())
+	return 0
+}
+
+func runDefensiveReview(ctx Context, mode securityreview.Mode, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet(string(mode), flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	formatValue := fs.String("format", string(securityreview.FormatBoth), "")
+	scopeValue := fs.String("scope", "", "")
+	evidenceValue := fs.String("evidence", string(securityreview.EvidenceRepro), "")
+	if err := fs.Parse(args); err != nil {
+		return fail(stderr, err)
+	}
+	scope := strings.TrimSpace(*scopeValue)
+	if scope == "" {
+		remaining := fs.Args()
+		if len(remaining) > 1 {
+			return fail(stderr, fmt.Errorf("expected at most one scope argument"))
+		}
+		if len(remaining) == 1 {
+			scope = remaining[0]
+		}
+	}
+	report, err := securityreview.Run(ctx.Root, securityreview.Options{
+		Mode:     mode,
+		Scope:    scope,
+		Format:   securityreview.OutputFormat(strings.ToLower(strings.TrimSpace(*formatValue))),
+		Evidence: securityreview.EvidencePreference(strings.ToLower(strings.TrimSpace(*evidenceValue))),
+	})
+	if err != nil {
+		return fail(stderr, err)
+	}
+	_, _ = fmt.Fprintln(stdout, report.Render(securityreview.OutputFormat(strings.ToLower(strings.TrimSpace(*formatValue)))))
 	return 0
 }
 
@@ -513,6 +553,7 @@ func runPrompt(ctx Context, options globalOptions, args []string, stdin io.Reade
 		}
 		summary, err := harness.RunPrompt(context.Background(), prompt, hruntime.PromptOptions{
 			Model:          options.Model,
+			Provider:       options.Provider,
 			PermissionMode: options.PermissionMode,
 			AllowedTools:   options.AllowedTools,
 			ResumeSession:  options.Resume,
@@ -1029,6 +1070,17 @@ func parseGlobalOptions(args []string) (globalOptions, []string, error) {
 			}
 			options.Model = value
 			index = next
+		case "--provider":
+			value, next, err := resolveFlagValue(args, index, hasInline, inline)
+			if err != nil {
+				return options, nil, err
+			}
+			provider, err := api.ParseProviderKind(value)
+			if err != nil {
+				return options, nil, err
+			}
+			options.Provider = provider
+			index = next
 		case "--permission-mode":
 			value, next, err := resolveFlagValue(args, index, hasInline, inline)
 			if err != nil {
@@ -1113,9 +1165,11 @@ func printHelp(stdout io.Writer) {
 		"product": version.Product,
 		"version": version.Version,
 		"usage": []string{
-			"ascaris [--model sonnet] [--permission-mode workspace-write] [--output-format json] <prompt>",
+			"ascaris [--model sonnet] [--provider anthropic] [--permission-mode workspace-write] [--output-format json] <prompt>",
 			"ascaris prompt <text>",
+			"ascaris security-review [--format markdown|json|both] [--scope path]",
 			"ascaris --resume latest <prompt>",
+			"ascaris --provider openai --model GLM-4.7-Flash prompt \"hello\"",
 			"ascaris status [--json]",
 			"ascaris doctor [--json]",
 			"ascaris login",
@@ -1125,6 +1179,7 @@ func printHelp(stdout io.Writer) {
 			"ascaris worker [list|create|get|observe|resolve-trust|await-ready|send-prompt|restart|terminate]",
 		},
 		"commands": []string{
+			"review", "security-review", "bughunter",
 			"summary", "manifest", "parity-audit", "setup-report", "command-graph", "tool-pool",
 			"bootstrap-graph", "subsystems", "commands", "tools", "route", "bootstrap", "turn-loop",
 			"flush-transcript", "load-session", "remote-mode", "ssh-mode", "teleport-mode",
@@ -1134,6 +1189,7 @@ func printHelp(stdout io.Writer) {
 		},
 		"global_flags": []string{
 			"--model <alias|model>",
+			"--provider <anthropic|openai|openrouter|xai>",
 			"--permission-mode <read-only|workspace-write|danger-full-access>",
 			"--allowedTools <csv>",
 			"--output-format <text|json>",
@@ -1157,6 +1213,9 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	case "/help":
 		_, _ = fmt.Fprintln(stdout, strings.Join([]string{
 			"Interactive slash commands:",
+			"- /review [scope]",
+			"- /security-review [scope]",
+			"- /bughunter [scope]",
 			"- /help",
 			"- /status",
 			"- /sandbox",
@@ -1192,6 +1251,12 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 		}
 		_, _ = fmt.Fprintln(stdout, report.Text())
 		return 0
+	case "/review":
+		return runDefensiveReview(ctx, securityreview.ModeReview, args[1:], stdout, stderr)
+	case "/security-review":
+		return runDefensiveReview(ctx, securityreview.ModeSecurityReview, args[1:], stdout, stderr)
+	case "/bughunter":
+		return runDefensiveReview(ctx, securityreview.ModeBugHunter, args[1:], stdout, stderr)
 	case "/sandbox":
 		_, _ = fmt.Fprintln(stdout, "mode=workspace-write\nfilesystem=.ascaris-aware\nnetwork=local-only")
 		return 0
@@ -1278,7 +1343,7 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	if strings.HasPrefix(command, "/oh-my-claudecode:") {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nCompatibility note: `%s` uses a legacy Claude Code/OMC plugin prefix. Import supported legacy assets with `ascaris migrate legacy`, then use the native `ascaris` command and plugin surface.", command, command))
 	}
-	suggestion := closestSlashCommand(command, []string{"/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
+	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
 	if suggestion != "" {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nDid you mean %s?", command, suggestion))
 	}
