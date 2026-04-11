@@ -3,9 +3,11 @@ package securityreview
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunFindsVulnerabilitiesAndAttachesRepro(t *testing.T) {
@@ -92,13 +94,103 @@ func TestRunAppliesEvidenceProfiles(t *testing.T) {
 	foundValidationStep := false
 	for _, finding := range patchReport.Findings {
 		for _, item := range finding.PatchGuidance {
-			if strings.Contains(item, "Validate the fix with the recorded failing test/build command") {
+			if strings.Contains(item, "Validate the fix with the recorded failing test, fuzz, or crash regression command") {
 				foundValidationStep = true
 			}
 		}
 	}
 	if !foundValidationStep {
 		t.Fatalf("expected patch profile to add validation guidance")
+	}
+}
+
+func TestRunSupportsFuzzWorkflow(t *testing.T) {
+	root := copyFixtureRepo(t, "fuzz_go")
+	report, err := Run(root, Options{
+		Mode:     ModeSecurityReview,
+		Workflow: WorkflowFuzz,
+		Format:   FormatJSON,
+		Evidence: EvidenceRepro,
+		Budget:   time.Second,
+		Timeout:  5 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("run fuzz workflow: %v", err)
+	}
+	if report.Workflow != WorkflowFuzz {
+		t.Fatalf("unexpected workflow: %s", report.Workflow)
+	}
+	var fuzzFinding *Finding
+	for i := range report.Findings {
+		if strings.HasPrefix(report.Findings[i].ID, "fuzz-") {
+			fuzzFinding = &report.Findings[i]
+			break
+		}
+	}
+	if fuzzFinding == nil {
+		t.Fatalf("expected fuzz finding, got %#v", report.Findings)
+	}
+	if fuzzFinding.TargetType != TargetTypeSourceRepo {
+		t.Fatalf("expected source repo target, got %#v", fuzzFinding)
+	}
+	if fuzzFinding.EvidenceKind != EvidenceKindCrashReproducer {
+		t.Fatalf("expected crash reproducer evidence, got %#v", fuzzFinding)
+	}
+	if !strings.Contains(fuzzFinding.RegressionCommand, "-fuzz=FuzzCrash") {
+		t.Fatalf("expected fuzz regression command, got %q", fuzzFinding.RegressionCommand)
+	}
+	if fuzzFinding.ReproducerPath == "" {
+		t.Fatalf("expected reproducer path, got %#v", fuzzFinding)
+	}
+	if data, err := os.ReadFile(fuzzFinding.ReproducerPath); err != nil || !strings.Contains(string(data), "panic") {
+		t.Fatalf("expected reproducer artifact with panic seed, err=%v", err)
+	}
+}
+
+func TestRunSupportsCrashTriageWorkflow(t *testing.T) {
+	root := copyFixtureRepo(t, "exec_crash")
+	binaryPath := filepath.Join(t.TempDir(), "crasher")
+	cmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/crasher")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOCACHE="+filepath.Join(root, ".cache", "go-build"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build crash fixture: %v\n%s", err, string(output))
+	}
+
+	report, err := Run(root, Options{
+		Mode:      ModeSecurityReview,
+		Workflow:  WorkflowBinary,
+		Format:    FormatJSON,
+		Evidence:  EvidenceRepro,
+		TargetCmd: binaryPath + " {{input}}",
+		CorpusDir: "corpus",
+		Timeout:   3 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("run binary workflow: %v", err)
+	}
+	if report.Workflow != WorkflowBinary {
+		t.Fatalf("unexpected workflow: %s", report.Workflow)
+	}
+	if len(report.Findings) != 1 {
+		t.Fatalf("expected one deduped crash finding, got %#v", report.Findings)
+	}
+	finding := report.Findings[0]
+	if finding.TargetType != TargetTypeLocalBinary {
+		t.Fatalf("expected local binary target, got %#v", finding)
+	}
+	if finding.DedupeKey == "" || finding.ReproducerPath == "" {
+		t.Fatalf("expected dedupe key and reproducer path, got %#v", finding)
+	}
+	if len(finding.ArtifactPaths) < 2 {
+		t.Fatalf("expected reproducer and log artifacts, got %#v", finding.ArtifactPaths)
+	}
+	if _, err := os.Stat(filepath.Join(report.RunDir, "report.md")); err != nil {
+		t.Fatalf("expected report markdown artifact: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(report.RunDir, "findings.json")); err != nil {
+		t.Fatalf("expected report json artifact: %v", err)
 	}
 }
 

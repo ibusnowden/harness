@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,34 @@ func TestSecurityReviewCommandAndSlashRun(t *testing.T) {
 	}
 	if code, stdout, stderr := runCLI(t, root, "/security-review", "--format", "markdown"); code != 0 || !strings.Contains(stdout, "# Security Review") || !strings.Contains(stdout, "TLS verification disabled") {
 		t.Fatalf("/security-review failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestFuzzCommandAndSlashRun(t *testing.T) {
+	root := copySecurityFixture(t, "fuzz_go")
+	if code, stdout, stderr := runCLI(t, root, "fuzz", "--format", "json", "--budget", "1s"); code != 0 || !strings.Contains(stdout, `"workflow": "fuzz"`) || !strings.Contains(stdout, `"crash_reproducer"`) {
+		t.Fatalf("fuzz failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if code, stdout, stderr := runCLI(t, root, "/fuzz", "--format", "markdown", "--budget", "1s"); code != 0 || !strings.Contains(stdout, "# Security Review") || !strings.Contains(stdout, "Go fuzz target crashes") {
+		t.Fatalf("/fuzz failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestCrashTriageCommandAndSlashRun(t *testing.T) {
+	root := copySecurityFixture(t, "exec_crash")
+	binaryPath := filepath.Join(t.TempDir(), "crasher")
+	cmd := exec.Command("go", "build", "-o", binaryPath, "./cmd/crasher")
+	cmd.Dir = root
+	cmd.Env = append(os.Environ(), "GOCACHE="+filepath.Join(root, ".cache", "go-build"))
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("build crash fixture: %v\n%s", err, string(output))
+	}
+	if code, stdout, stderr := runCLI(t, root, "crash-triage", "--format", "json", "--target-cmd", binaryPath+" {{input}}", "--corpus", "corpus"); code != 0 || !strings.Contains(stdout, `"workflow": "binary"`) || !strings.Contains(stdout, `"target_type": "local_binary"`) {
+		t.Fatalf("crash-triage failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if code, stdout, stderr := runCLI(t, root, "/crash-triage", "--format", "markdown", "--target-cmd", binaryPath+" {{input}}", "--corpus", "corpus"); code != 0 || !strings.Contains(stdout, "Crash signature reproduced") {
+		t.Fatalf("/crash-triage failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }
 

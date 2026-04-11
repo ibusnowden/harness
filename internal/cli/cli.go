@@ -96,11 +96,15 @@ func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	case "doctor":
 		return runDoctor(ctx, remaining[1:], stdout, stderr)
 	case "review":
-		return runDefensiveReview(ctx, securityreview.ModeReview, remaining[1:], stdout, stderr)
+		return runSecurityWorkflow(ctx, securityreview.ModeReview, securityreview.WorkflowSource, remaining[1:], stdout, stderr)
 	case "security-review":
-		return runDefensiveReview(ctx, securityreview.ModeSecurityReview, remaining[1:], stdout, stderr)
+		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowAuto, remaining[1:], stdout, stderr)
 	case "bughunter":
-		return runDefensiveReview(ctx, securityreview.ModeBugHunter, remaining[1:], stdout, stderr)
+		return runSecurityWorkflow(ctx, securityreview.ModeBugHunter, securityreview.WorkflowSource, remaining[1:], stdout, stderr)
+	case "fuzz":
+		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowFuzz, remaining[1:], stdout, stderr)
+	case "crash-triage":
+		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowBinary, remaining[1:], stdout, stderr)
 	case "sandbox":
 		_, _ = fmt.Fprintln(stdout, "mode=workspace-write\nfilesystem=.ascaris-aware\nnetwork=local-only")
 		return 0
@@ -240,12 +244,18 @@ func runDoctor(ctx Context, args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-func runDefensiveReview(ctx Context, mode securityreview.Mode, args []string, stdout, stderr io.Writer) int {
+func runSecurityWorkflow(ctx Context, mode securityreview.Mode, defaultWorkflow securityreview.Workflow, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet(string(mode), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	workflowValue := fs.String("workflow", string(defaultWorkflow), "")
 	formatValue := fs.String("format", string(securityreview.FormatBoth), "")
 	scopeValue := fs.String("scope", "", "")
 	evidenceValue := fs.String("evidence", string(securityreview.EvidenceRepro), "")
+	targetCmdValue := fs.String("target-cmd", "", "")
+	corpusValue := fs.String("corpus", "", "")
+	artifactsValue := fs.String("artifacts-dir", "", "")
+	budgetValue := fs.Duration("budget", 0, "")
+	timeoutValue := fs.Duration("timeout", 0, "")
 	if err := fs.Parse(args); err != nil {
 		return fail(stderr, err)
 	}
@@ -260,10 +270,16 @@ func runDefensiveReview(ctx Context, mode securityreview.Mode, args []string, st
 		}
 	}
 	report, err := securityreview.Run(ctx.Root, securityreview.Options{
-		Mode:     mode,
-		Scope:    scope,
-		Format:   securityreview.OutputFormat(strings.ToLower(strings.TrimSpace(*formatValue))),
-		Evidence: securityreview.EvidencePreference(strings.ToLower(strings.TrimSpace(*evidenceValue))),
+		Mode:         mode,
+		Workflow:     securityreview.Workflow(strings.ToLower(strings.TrimSpace(*workflowValue))),
+		Scope:        scope,
+		Format:       securityreview.OutputFormat(strings.ToLower(strings.TrimSpace(*formatValue))),
+		Evidence:     securityreview.EvidencePreference(strings.ToLower(strings.TrimSpace(*evidenceValue))),
+		TargetCmd:    strings.TrimSpace(*targetCmdValue),
+		CorpusDir:    strings.TrimSpace(*corpusValue),
+		ArtifactsDir: strings.TrimSpace(*artifactsValue),
+		Budget:       *budgetValue,
+		Timeout:      *timeoutValue,
 	})
 	if err != nil {
 		return fail(stderr, err)
@@ -1167,7 +1183,9 @@ func printHelp(stdout io.Writer) {
 		"usage": []string{
 			"ascaris [--model sonnet] [--provider anthropic] [--permission-mode workspace-write] [--output-format json] <prompt>",
 			"ascaris prompt <text>",
-			"ascaris security-review [--format markdown|json|both] [--scope path]",
+			"ascaris security-review [--workflow auto|source|fuzz|binary] [--format markdown|json|both] [--scope path]",
+			"ascaris fuzz [--scope path] [--budget 2s]",
+			"ascaris crash-triage --target-cmd /path/to/binary --corpus corpus/",
 			"ascaris --resume latest <prompt>",
 			"ascaris --provider openai --model GLM-4.7-Flash prompt \"hello\"",
 			"ascaris status [--json]",
@@ -1179,7 +1197,7 @@ func printHelp(stdout io.Writer) {
 			"ascaris worker [list|create|get|observe|resolve-trust|await-ready|send-prompt|restart|terminate]",
 		},
 		"commands": []string{
-			"review", "security-review", "bughunter",
+			"review", "security-review", "bughunter", "fuzz", "crash-triage",
 			"summary", "manifest", "parity-audit", "setup-report", "command-graph", "tool-pool",
 			"bootstrap-graph", "subsystems", "commands", "tools", "route", "bootstrap", "turn-loop",
 			"flush-transcript", "load-session", "remote-mode", "ssh-mode", "teleport-mode",
@@ -1194,6 +1212,7 @@ func printHelp(stdout io.Writer) {
 			"--allowedTools <csv>",
 			"--output-format <text|json>",
 			"--resume <session-id|latest>",
+			"security flags: --workflow --scope --target-cmd --corpus --artifacts-dir --budget --timeout --evidence --format",
 		},
 	}
 	data, _ := json.MarshalIndent(help, "", "  ")
@@ -1216,6 +1235,8 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 			"- /review [scope]",
 			"- /security-review [scope]",
 			"- /bughunter [scope]",
+			"- /fuzz [scope]",
+			"- /crash-triage --target-cmd /path/to/binary --corpus corpus/",
 			"- /help",
 			"- /status",
 			"- /sandbox",
@@ -1252,11 +1273,15 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 		_, _ = fmt.Fprintln(stdout, report.Text())
 		return 0
 	case "/review":
-		return runDefensiveReview(ctx, securityreview.ModeReview, args[1:], stdout, stderr)
+		return runSecurityWorkflow(ctx, securityreview.ModeReview, securityreview.WorkflowSource, args[1:], stdout, stderr)
 	case "/security-review":
-		return runDefensiveReview(ctx, securityreview.ModeSecurityReview, args[1:], stdout, stderr)
+		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowAuto, args[1:], stdout, stderr)
 	case "/bughunter":
-		return runDefensiveReview(ctx, securityreview.ModeBugHunter, args[1:], stdout, stderr)
+		return runSecurityWorkflow(ctx, securityreview.ModeBugHunter, securityreview.WorkflowSource, args[1:], stdout, stderr)
+	case "/fuzz":
+		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowFuzz, args[1:], stdout, stderr)
+	case "/crash-triage":
+		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowBinary, args[1:], stdout, stderr)
 	case "/sandbox":
 		_, _ = fmt.Fprintln(stdout, "mode=workspace-write\nfilesystem=.ascaris-aware\nnetwork=local-only")
 		return 0
@@ -1343,7 +1368,7 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	if strings.HasPrefix(command, "/oh-my-claudecode:") {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nCompatibility note: `%s` uses a legacy Claude Code/OMC plugin prefix. Import supported legacy assets with `ascaris migrate legacy`, then use the native `ascaris` command and plugin surface.", command, command))
 	}
-	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
+	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
 	if suggestion != "" {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nDid you mean %s?", command, suggestion))
 	}
