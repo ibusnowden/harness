@@ -26,6 +26,7 @@ import (
 	"ascaris/internal/migrations"
 	"ascaris/internal/modes"
 	"ascaris/internal/oauth"
+	"ascaris/internal/outputstyles"
 	"ascaris/internal/parity"
 	"ascaris/internal/permissions"
 	"ascaris/internal/plugins"
@@ -56,12 +57,29 @@ type globalOptions struct {
 	Resume         string
 }
 
+type livePromptHarness interface {
+	RunPrompt(context.Context, string, hruntime.PromptOptions) (hruntime.PromptSummary, error)
+}
+
+type promptSpinner interface {
+	Start(string)
+	Update(string)
+	Stop()
+}
+
 var browserOpener = openBrowser
 var oauthStateGenerator = oauth.GenerateState
 var oauthWaitForCallback = oauth.WaitForCallback
 var oauthCodeExchanger = func(ctx context.Context, client *http.Client, settings *config.OAuthSettings, code, verifier, redirectURI string) (oauth.TokenSet, error) {
 	return oauth.ExchangeCode(ctx, client, settings, code, verifier, redirectURI)
 }
+var newLiveHarness = func(root string) (livePromptHarness, error) {
+	return hruntime.NewLiveHarness(root)
+}
+var newPromptSpinner = func(writer io.Writer) promptSpinner {
+	return outputstyles.NewPromptSpinner(writer)
+}
+var isInteractiveWriter = outputstyles.IsInteractiveWriter
 
 func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	options, remaining, err := parseGlobalOptions(args)
@@ -563,18 +581,28 @@ func runPrompt(ctx Context, options globalOptions, args []string, stdin io.Reade
 		if options.OutputFormat != "text" && options.OutputFormat != "json" {
 			return fail(stderr, fmt.Errorf("unsupported output format: %s", options.OutputFormat))
 		}
-		harness, err := hruntime.NewLiveHarness(ctx.Root)
+		harness, err := newLiveHarness(ctx.Root)
 		if err != nil {
 			return fail(stderr, err)
 		}
-		summary, err := harness.RunPrompt(context.Background(), prompt, hruntime.PromptOptions{
+		promptOptions := hruntime.PromptOptions{
 			Model:          options.Model,
 			Provider:       options.Provider,
 			PermissionMode: options.PermissionMode,
 			AllowedTools:   options.AllowedTools,
 			ResumeSession:  options.Resume,
 			Prompter:       stdioPrompter{stdin: stdin, stdout: stdout},
-		})
+		}
+		var spinner promptSpinner
+		if options.OutputFormat == "text" && isInteractiveWriter(stderr) {
+			spinner = newPromptSpinner(stderr)
+			spinner.Start(promptSpinnerLabel(hruntime.PromptPhaseStarting))
+			promptOptions.Progress = func(progress hruntime.PromptProgress) {
+				spinner.Update(promptSpinnerLabel(progress.Phase))
+			}
+			defer spinner.Stop()
+		}
+		summary, err := harness.RunPrompt(context.Background(), prompt, promptOptions)
 		if err != nil {
 			return fail(stderr, err)
 		}
@@ -594,6 +622,21 @@ func runPrompt(ctx Context, options globalOptions, args []string, stdin io.Reade
 	}
 	_, _ = fmt.Fprintln(stdout, session.TurnResult.Output)
 	return 0
+}
+
+func promptSpinnerLabel(phase hruntime.PromptPhase) string {
+	switch phase {
+	case hruntime.PromptPhaseStarting:
+		return "Starting"
+	case hruntime.PromptPhaseWaitingModel:
+		return "Thinking"
+	case hruntime.PromptPhaseExecutingTools:
+		return "Using tools"
+	case hruntime.PromptPhaseFinalizing:
+		return "Finalizing"
+	default:
+		return "Working"
+	}
 }
 
 func runAgentsCommand(ctx Context, args []string, stdout, stderr io.Writer) int {

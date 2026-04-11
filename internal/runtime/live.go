@@ -28,6 +28,22 @@ type PromptOptions struct {
 	MaxTokens              int
 	AutoCompactInputTokens int
 	Prompter               tools.ApprovalPrompter
+	Progress               func(PromptProgress)
+}
+
+type PromptPhase string
+
+const (
+	PromptPhaseStarting       PromptPhase = "starting"
+	PromptPhaseWaitingModel   PromptPhase = "waiting_model"
+	PromptPhaseExecutingTools PromptPhase = "executing_tools"
+	PromptPhaseFinalizing     PromptPhase = "finalizing"
+)
+
+type PromptProgress struct {
+	Phase     PromptPhase `json:"phase"`
+	Iteration int         `json:"iteration"`
+	ToolCount int         `json:"tool_count,omitempty"`
 }
 
 type PromptSummary struct {
@@ -120,7 +136,12 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		PromptCacheEvents: []any{},
 		SessionID:         session.Meta.SessionID,
 	}
+	emitPromptProgress(opts, PromptProgress{Phase: PromptPhaseStarting})
 	for iteration := 0; iteration < max(1, opts.MaxIterations); iteration++ {
+		emitPromptProgress(opts, PromptProgress{
+			Phase:     PromptPhaseWaitingModel,
+			Iteration: iteration + 1,
+		})
 		request := api.MessageRequest{
 			Model:     resolveModel(opts.Model),
 			MaxTokens: max(256, opts.MaxTokens),
@@ -154,6 +175,10 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			})
 		}
 		if len(liveCalls) == 0 {
+			emitPromptProgress(opts, PromptProgress{
+				Phase:     PromptPhaseFinalizing,
+				Iteration: iteration + 1,
+			})
 			summary.Message = response.FinalText()
 			summary.Usage = session.Meta.Usage
 			summary.EstimatedCost = formatUSD(estimateCost(session.Meta.Usage, opts.Model))
@@ -162,6 +187,11 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			}
 			return summary, nil
 		}
+		emitPromptProgress(opts, PromptProgress{
+			Phase:     PromptPhaseExecutingTools,
+			Iteration: iteration + 1,
+			ToolCount: len(liveCalls),
+		})
 		envelopes := make([]api.ToolResultEnvelope, 0, len(liveCalls))
 		for _, call := range liveCalls {
 			result := liveRuntime.ExecuteTool(ctx, call)
@@ -174,6 +204,10 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		}
 		session.Messages = append(session.Messages, api.ToolResultMessage(envelopes))
 	}
+	emitPromptProgress(opts, PromptProgress{
+		Phase:     PromptPhaseFinalizing,
+		Iteration: summary.Iterations,
+	})
 	summary.Usage = session.Meta.Usage
 	summary.EstimatedCost = formatUSD(estimateCost(session.Meta.Usage, opts.Model))
 	if _, err := sessions.SaveManaged(session, h.Root); err != nil {
@@ -183,6 +217,13 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		summary.Message = "prompt stopped before the model produced a final assistant message"
 	}
 	return summary, nil
+}
+
+func emitPromptProgress(opts PromptOptions, progress PromptProgress) {
+	if opts.Progress == nil {
+		return
+	}
+	opts.Progress(progress)
 }
 
 func (s PromptSummary) JSON() string {
