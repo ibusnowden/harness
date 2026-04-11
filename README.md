@@ -1,4 +1,5 @@
 # Ascaris
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ibusnowden/harness)
 
 Ascaris is a Go coding harness built for local CLI use, standalone binaries, and a future `curl | sh` install flow.
 
