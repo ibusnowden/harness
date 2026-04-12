@@ -69,3 +69,5 @@ ASCARIS_CONFIG_HOME=/tmp/ascaris ./bin/ascaris session list
 mkdir -p .cache/go-build
 GOCACHE="$(pwd)/.cache/go-build" go test ./...
 ```
+
+For a physical prompt-first terminal validation pass, use [`docs/prompt-e2e-stress-test.md`](./docs/prompt-e2e-stress-test.md).

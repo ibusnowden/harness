@@ -1,5 +1,6 @@
 # Ascaris
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ibusnowden/harness)
+![Testing Status](./assets/testing-status-badges.svg)
 
 Ascaris is a Go coding harness built for local CLI use, standalone binaries, and a future `curl | sh` install flow.
 
@@ -45,6 +46,7 @@ Ascaris stores config and runtime state under `.ascaris/` by default. Override t
 ## Documentation Map
 
 - [`USAGE.md`](./USAGE.md) — build/install and CLI usage
+- [`docs/prompt-e2e-stress-test.md`](./docs/prompt-e2e-stress-test.md) — prompt-first physical E2E stress-test runbook
 - [`PARITY.md`](./PARITY.md) — current Go traceability and contract notes
 - [`ROADMAP.md`](./ROADMAP.md) — current product direction
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — product intent and operating model

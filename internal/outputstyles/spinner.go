@@ -13,20 +13,45 @@ import (
 const promptSpinnerInterval = 750 * time.Millisecond
 
 var defaultPromptPhrases = []string{
-	"Threat-modeling",
+	"Bombaclatt",
+	"Paibraniang",
+	"Dioplemaire",
+	"Binexna",
+	"Naynexxx",
+	"Ratatouille",
+	"Pimping",
+	"Thiebouyapp",
+	"Niece",
+	"Jollofrice",
+	"Mafe-yapp",
+	"Pobar",
 	"Fuzzing",
-	"Patch-validating",
-	"Regression-testing",
-	"Dependency-auditing",
-	"Evidence-gathering",
-	"Variant-reviewing",
-	"Log-correlating",
-	"CVE-triaging",
-	"Input-hardening",
-	"Boundary-checking",
-	"Static-analyzing",
-	"Session-reviewing",
-	"Attack-surface-reviewing",
+	"Snodening",
+	"Whisperer",
+	"Sonkoing",
+	"Layewade",
+	"Galsen",
+	"Senegambia",
+	"Askanu-Lawbee",
+	"Dioyou-fadiar",
+	"Boulkoyerem",
+	"fkTheyTalkingAbout",
+	"Youknoehmsayyying",
+	"Maannnne",
+	"Thatscraazy",
+	"Razzing",
+	"Dazzling",
+	"Yapping",
+	"Memphian",
+	"Grizzlies",
+	"Dafoe",
+	"Loiseau",
+	"Safari",
+	"No-overthinking",
+	"Go-do-it-man",
+	"God-did",
+	"Stop-worrying",
+	"Start-living",
 }
 
 var defaultSpinnerFrames = []string{"-", "\\", "|", "/"}
@@ -137,7 +162,6 @@ func (s *PromptSpinner) loop() {
 				return
 			}
 			s.frameIndex = nextIndex(s.frameIndex, len(s.frames))
-			s.phraseIndex = nextIndex(s.phraseIndex, len(s.phrases))
 			s.renderLocked()
 			s.mu.Unlock()
 		case <-s.stopCh:
@@ -170,7 +194,7 @@ func (s *PromptSpinner) Stop() {
 	<-doneCh
 
 	s.mu.Lock()
-	s.clearLocked()
+	s.clearLocked(true)
 	s.mu.Unlock()
 }
 
@@ -217,11 +241,16 @@ func (s *PromptSpinner) renderLocked() {
 	s.lastWidth = len(line)
 }
 
-func (s *PromptSpinner) clearLocked() {
+func (s *PromptSpinner) clearLocked(withNewline bool) {
 	if s.writer == nil || s.lastWidth == 0 {
 		return
 	}
-	_, _ = fmt.Fprintf(s.writer, "\r%s\r", strings.Repeat(" ", s.lastWidth))
+	_, _ = fmt.Fprintf(s.writer, "\r\033[2K")
+	if withNewline {
+		_, _ = fmt.Fprint(s.writer, "\n")
+	} else {
+		_, _ = fmt.Fprint(s.writer, "\r")
+	}
 	s.lastWidth = 0
 }
 

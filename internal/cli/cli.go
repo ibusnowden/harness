@@ -67,6 +67,76 @@ type promptSpinner interface {
 	Stop()
 }
 
+type spinnerController struct {
+	spinner promptSpinner
+	label   string
+	running bool
+}
+
+func newSpinnerController(spinner promptSpinner) *spinnerController {
+	if spinner == nil {
+		return nil
+	}
+	return &spinnerController{spinner: spinner}
+}
+
+func (c *spinnerController) Start(label string) {
+	if c == nil || c.spinner == nil {
+		return
+	}
+	c.label = label
+	if c.running {
+		c.spinner.Update(label)
+		return
+	}
+	c.spinner.Start(label)
+	c.running = true
+}
+
+func (c *spinnerController) Update(label string) {
+	if c == nil || c.spinner == nil {
+		return
+	}
+	c.label = label
+	if !c.running {
+		return
+	}
+	c.spinner.Update(label)
+}
+
+func (c *spinnerController) Pause() {
+	if c == nil || c.spinner == nil || !c.running {
+		return
+	}
+	c.spinner.Stop()
+	c.running = false
+}
+
+func (c *spinnerController) Resume() {
+	if c == nil || c.spinner == nil || c.running {
+		return
+	}
+	c.spinner.Start(c.label)
+	c.running = true
+}
+
+func (c *spinnerController) Stop() {
+	c.Pause()
+}
+
+type spinnerAwarePrompter struct {
+	base    tools.ApprovalPrompter
+	spinner *spinnerController
+}
+
+func (p spinnerAwarePrompter) Approve(toolName string, input string) (bool, error) {
+	if p.spinner != nil {
+		p.spinner.Pause()
+		defer p.spinner.Resume()
+	}
+	return p.base.Approve(toolName, input)
+}
+
 var browserOpener = openBrowser
 var oauthStateGenerator = oauth.GenerateState
 var oauthWaitForCallback = oauth.WaitForCallback
@@ -591,18 +661,22 @@ func runPrompt(ctx Context, options globalOptions, args []string, stdin io.Reade
 			PermissionMode: options.PermissionMode,
 			AllowedTools:   options.AllowedTools,
 			ResumeSession:  options.Resume,
-			Prompter:       stdioPrompter{stdin: stdin, stdout: stdout},
 		}
-		var spinner promptSpinner
+		basePrompter := stdioPrompter{stdin: stdin, stdout: stdout}
+		promptOptions.Prompter = basePrompter
+		var spinner *spinnerController
 		if options.OutputFormat == "text" && isInteractiveWriter(stderr) {
-			spinner = newPromptSpinner(stderr)
+			spinner = newSpinnerController(newPromptSpinner(stderr))
 			spinner.Start(promptSpinnerLabel(hruntime.PromptPhaseStarting))
+			promptOptions.Prompter = spinnerAwarePrompter{base: basePrompter, spinner: spinner}
 			promptOptions.Progress = func(progress hruntime.PromptProgress) {
 				spinner.Update(promptSpinnerLabel(progress.Phase))
 			}
-			defer spinner.Stop()
 		}
 		summary, err := harness.RunPrompt(context.Background(), prompt, promptOptions)
+		if spinner != nil {
+			spinner.Stop()
+		}
 		if err != nil {
 			return fail(stderr, err)
 		}
