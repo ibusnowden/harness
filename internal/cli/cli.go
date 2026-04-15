@@ -2,18 +2,22 @@ package cli
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 
 	"ascaris/internal/agents"
 	"ascaris/internal/api"
@@ -32,6 +36,7 @@ import (
 	"ascaris/internal/plugins"
 	"ascaris/internal/pool"
 	"ascaris/internal/query"
+	"ascaris/internal/repl"
 	hruntime "ascaris/internal/runtime"
 	"ascaris/internal/securityreview"
 	"ascaris/internal/sessions"
@@ -150,6 +155,8 @@ var newPromptSpinner = func(writer io.Writer) promptSpinner {
 	return outputstyles.NewPromptSpinner(writer)
 }
 var isInteractiveWriter = outputstyles.IsInteractiveWriter
+var isInteractiveReader = isInteractiveStream
+var launchREPL = repl.Launch
 
 func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	options, remaining, err := parseGlobalOptions(args)
@@ -157,6 +164,9 @@ func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return fail(stderr, err)
 	}
 	if len(remaining) == 0 {
+		if isInteractiveReader(stdin) {
+			return runInteractiveREPL(ctx, options, stdin, stdout, stderr)
+		}
 		if hruntime.LiveConfigured() || liveConfigAvailable(ctx.Root) {
 			prompt, err := hruntime.ReadPrompt(stdin)
 			if err != nil {
@@ -336,7 +346,7 @@ func runSecurityWorkflow(ctx Context, mode securityreview.Mode, defaultWorkflow 
 	fs := flag.NewFlagSet(string(mode), flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	workflowValue := fs.String("workflow", string(defaultWorkflow), "")
-	formatValue := fs.String("format", string(securityreview.FormatBoth), "")
+	formatValue := fs.String("format", string(securityreview.FormatMarkdown), "")
 	scopeValue := fs.String("scope", "", "")
 	evidenceValue := fs.String("evidence", string(securityreview.EvidenceRepro), "")
 	targetCmdValue := fs.String("target-cmd", "", "")
@@ -655,28 +665,7 @@ func runPrompt(ctx Context, options globalOptions, args []string, stdin io.Reade
 		if err != nil {
 			return fail(stderr, err)
 		}
-		promptOptions := hruntime.PromptOptions{
-			Model:          options.Model,
-			Provider:       options.Provider,
-			PermissionMode: options.PermissionMode,
-			AllowedTools:   options.AllowedTools,
-			ResumeSession:  options.Resume,
-		}
-		basePrompter := stdioPrompter{stdin: stdin, stdout: stdout}
-		promptOptions.Prompter = basePrompter
-		var spinner *spinnerController
-		if options.OutputFormat == "text" && isInteractiveWriter(stderr) {
-			spinner = newSpinnerController(newPromptSpinner(stderr))
-			spinner.Start(promptSpinnerLabel(hruntime.PromptPhaseStarting))
-			promptOptions.Prompter = spinnerAwarePrompter{base: basePrompter, spinner: spinner}
-			promptOptions.Progress = func(progress hruntime.PromptProgress) {
-				spinner.Update(promptSpinnerLabel(progress.Phase))
-			}
-		}
-		summary, err := harness.RunPrompt(context.Background(), prompt, promptOptions)
-		if spinner != nil {
-			spinner.Stop()
-		}
+		summary, err := runLivePrompt(harness, ctx.Root, prompt, options, stdin, stdout, stderr)
 		if err != nil {
 			return fail(stderr, err)
 		}
@@ -696,6 +685,333 @@ func runPrompt(ctx Context, options globalOptions, args []string, stdin io.Reade
 	}
 	_, _ = fmt.Fprintln(stdout, session.TurnResult.Output)
 	return 0
+}
+
+func runInteractiveREPL(ctx Context, options globalOptions, stdin io.Reader, stdout, stderr io.Writer) int {
+	if options.OutputFormat != "text" {
+		return fail(stderr, fmt.Errorf("interactive TUI only supports --output-format text"))
+	}
+	harness, err := newLiveHarness(ctx.Root)
+	if err != nil {
+		return fail(stderr, err)
+	}
+	sessionRef := options.Resume
+	if strings.TrimSpace(sessionRef) == "" {
+		sessionRef = "latest"
+	}
+	modelLabel, providerLabel, permissionLabel := promptDefaults(ctx.Root, options)
+	err = launchREPL(context.Background(), repl.Config{
+		In:  stdin,
+		Out: stdout,
+		Status: repl.Status{
+			Product:    version.Product,
+			Version:    version.Version,
+			Workspace:  ctx.Root,
+			SessionID:  resolveSessionLabel(ctx.Root, sessionRef),
+			Model:      modelLabel,
+			Provider:   providerLabel,
+			Permission: permissionLabel,
+			Recent:     latestSessionSummary(ctx.Root),
+		},
+		RunPrompt: func(runCtx context.Context, prompt string, emit func(tea.Msg)) {
+			turnOptions := options
+			turnOptions.Resume = sessionRef
+			promptOptions := hruntime.PromptOptions{
+				Model:          turnOptions.Model,
+				Provider:       turnOptions.Provider,
+				PermissionMode: turnOptions.PermissionMode,
+				AllowedTools:   turnOptions.AllowedTools,
+				ResumeSession:  turnOptions.Resume,
+				Progress: func(progress hruntime.PromptProgress) {
+					emit(repl.ProgressEvent{Label: promptSpinnerLabel(progress.Phase)})
+				},
+				Activity: func(activity hruntime.ActivityEvent) {
+					emit(repl.ActivityEvent{
+						Kind:    activity.Kind,
+						Title:   activity.Title,
+						Summary: activity.Summary,
+						Detail:  activity.Detail,
+						Error:   activity.Error,
+						EntryID: activity.EntryID,
+					})
+				},
+			}
+			promptOptions.Prompter = tuiApprovalPrompter{emit: emit}
+			summary, err := harness.RunPrompt(runCtx, prompt, promptOptions)
+			if err != nil {
+				emit(repl.TurnFailed{Message: err.Error()})
+				return
+			}
+			if sessionRef == "" {
+				sessionRef = "latest"
+			}
+			emit(repl.TurnComplete{
+				Message:   summary.Message,
+				EntryID:   resultEntryID(summary.TurnID, summary.Iterations),
+				SessionID: fallbackString(summary.SessionID, resolveSessionLabel(ctx.Root, sessionRef)),
+				Model:     fallbackString(summary.Model, turnOptions.Model),
+				Provider:  summary.Provider,
+				TokensIn:  summary.Usage.InputTokens + summary.Usage.CacheCreationInputTokens + summary.Usage.CacheReadInputTokens,
+				TokensOut: summary.Usage.OutputTokens,
+				CostEst:   summary.EstimatedCost,
+			})
+		},
+		HandleSlash: func(_ context.Context, line string) repl.SlashResult {
+			result := runSlashInTUI(ctx, options, line)
+			switch {
+			case result.ResetState:
+				sessionRef = ""
+			case strings.HasPrefix(line, "/session switch"):
+				if strings.TrimSpace(options.Resume) == "" {
+					sessionRef = "latest"
+				}
+			}
+			if result.SessionID == "" {
+				result.SessionID = resolveSessionLabel(ctx.Root, sessionRef)
+			}
+			// Propagate model/provider changes so future RunPrompt calls use them
+			if strings.TrimSpace(result.UpdateModel) != "" {
+				options.Model = result.UpdateModel
+			}
+			if strings.TrimSpace(result.UpdateProvider) != "" {
+				switch {
+				case strings.HasPrefix(line, "/provider") && strings.Contains(line, "auto"):
+					options.Provider = ""
+				case strings.HasPrefix(line, "/model") && options.Provider == "":
+					// Keep provider auto-selected while refreshing the displayed label.
+				default:
+					options.Provider = api.ProviderKind(strings.TrimSpace(result.UpdateProvider))
+				}
+			}
+			return result
+		},
+	})
+	if err != nil {
+		return fail(stderr, err)
+	}
+	return 0
+}
+
+type tuiApprovalPrompter struct {
+	emit func(tea.Msg)
+}
+
+func (p tuiApprovalPrompter) Approve(toolName string, input string) (bool, error) {
+	response := make(chan bool, 1)
+	p.emit(repl.ApprovalRequest{
+		ToolName: toolName,
+		Input:    input,
+		Response: response,
+	})
+	approved := <-response
+	return approved, nil
+}
+
+func resultEntryID(turnID string, iteration int) string {
+	turnID = strings.TrimSpace(turnID)
+	if turnID == "" || iteration <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s-iter-%d-result", turnID, iteration)
+}
+
+func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashResult {
+	args, err := splitInteractiveCommand(line)
+	if err != nil {
+		return repl.SlashResult{Output: err.Error(), Error: true}
+	}
+	// Handle TUI-only commands that update session state but don't need runSlashCommand
+	if len(args) > 0 {
+		switch args[0] {
+		case "/model":
+			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+				current := fallbackString(options.Model, "default")
+				return repl.SlashResult{Output: fmt.Sprintf("Usage: /model <model-name>\nCurrent model: %s", current)}
+			}
+			newModel := strings.TrimSpace(args[1])
+			_, providerLabel, _ := promptDefaults(ctx.Root, globalOptions{
+				Model:          newModel,
+				Provider:       options.Provider,
+				PermissionMode: options.PermissionMode,
+			})
+			return repl.SlashResult{
+				Output:         fmt.Sprintf("Model set to %s for this session.", newModel),
+				UpdateModel:    newModel,
+				UpdateProvider: providerLabel,
+			}
+		case "/summary":
+			return repl.SlashResult{
+				Output: "Asking the model to summarize this session…",
+				RunPrompt: "Please write a concise summary of everything we have accomplished in this session: " +
+					"what was asked, what approach was taken, which files were changed and how, " +
+					"what problems were solved, and what the current state is. " +
+					"Keep the summary under 300 words and use bullet points where helpful.",
+			}
+		case "/provider":
+			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
+				current := fallbackString(displayProvider(options.Provider), "auto")
+				return repl.SlashResult{Output: fmt.Sprintf("Usage: /provider <provider-name>\nCurrent provider: %s", current)}
+			}
+			newProvider := strings.TrimSpace(args[1])
+			effectiveProvider := newProvider
+			if strings.EqualFold(newProvider, "auto") {
+				_, providerLabel, _ := promptDefaults(ctx.Root, globalOptions{
+					Model:          options.Model,
+					PermissionMode: options.PermissionMode,
+				})
+				effectiveProvider = providerLabel
+			}
+			return repl.SlashResult{
+				Output:         fmt.Sprintf("Provider set to %s for this session.", newProvider),
+				UpdateProvider: effectiveProvider,
+			}
+		}
+	}
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	code := runSlashCommand(ctx, options, args, &stdout, &stderr)
+	output := strings.TrimSpace(stdout.String())
+	errOutput := strings.TrimSpace(stderr.String())
+	if errOutput != "" {
+		if output != "" {
+			output += "\n"
+		}
+		output += errOutput
+	}
+	result := repl.SlashResult{
+		Output: strings.TrimSpace(output),
+		Error:  code != 0,
+	}
+	switch {
+	case line == "/clear" || line == "/clear --confirm" || strings.HasPrefix(line, "/session clear"):
+		result.ResetState = true
+		result.SessionID = "new"
+	case strings.HasPrefix(line, "/session switch") && code == 0:
+		result.SessionID = resolveSessionLabel(ctx.Root, "latest")
+	case line == "/help":
+		result.OutputKind = "help"
+	}
+	return result
+}
+
+func runLivePrompt(harness livePromptHarness, root, prompt string, options globalOptions, stdin io.Reader, stdout, stderr io.Writer) (hruntime.PromptSummary, error) {
+	promptOptions := hruntime.PromptOptions{
+		Model:          options.Model,
+		Provider:       options.Provider,
+		PermissionMode: options.PermissionMode,
+		AllowedTools:   options.AllowedTools,
+		ResumeSession:  options.Resume,
+	}
+	basePrompter := stdioPrompter{stdin: stdin, stdout: stdout}
+	promptOptions.Prompter = basePrompter
+	var spinner *spinnerController
+	if options.OutputFormat == "text" && isInteractiveWriter(stderr) {
+		spinner = newSpinnerController(newPromptSpinner(stderr))
+		spinner.Start(promptSpinnerLabel(hruntime.PromptPhaseStarting))
+		promptOptions.Prompter = spinnerAwarePrompter{base: basePrompter, spinner: spinner}
+		promptOptions.Progress = func(progress hruntime.PromptProgress) {
+			spinner.Update(promptSpinnerLabel(progress.Phase))
+		}
+	}
+	summary, err := harness.RunPrompt(context.Background(), prompt, promptOptions)
+	if spinner != nil {
+		spinner.Stop()
+	}
+	return summary, err
+}
+
+func promptDefaults(root string, options globalOptions) (string, string, string) {
+	modelLabel := "not configured"
+	providerLabel := "auto"
+	permissionLabel := string(hruntime.DefaultPromptOptions().PermissionMode)
+	runtimeConfig, err := config.Load(root)
+	if err == nil {
+		if value := runtimeConfig.Model(); value != "" {
+			modelLabel = value
+		}
+		if value := runtimeConfig.ProviderSettings().Kind; value != "" {
+			providerLabel = value
+		}
+		if value := runtimeConfig.PermissionMode(); value != "" {
+			permissionLabel = value
+		}
+	}
+	if value := strings.TrimSpace(options.Model); value != "" {
+		modelLabel = value
+	}
+	if value := strings.TrimSpace(string(options.Provider)); value != "" {
+		providerLabel = value
+	}
+	if value := strings.TrimSpace(string(options.PermissionMode)); value != "" {
+		permissionLabel = value
+	}
+	// If provider is still "auto", resolve what will actually be used given the
+	// current environment so the header shows e.g. "openrouter" not "auto".
+	if providerLabel == "auto" || providerLabel == "" {
+		settings := runtimeConfig.ProviderSettings()
+		detected := api.AutoDetectProvider(modelLabel, api.ProviderConfig{
+			AnthropicBaseURL:  settings.AnthropicBaseURL,
+			OpenAIBaseURL:     settings.OpenAIBaseURL,
+			OpenRouterBaseURL: settings.OpenRouterBaseURL,
+			XAIBaseURL:        settings.XAIBaseURL,
+			ProxyURL:          settings.ProxyURL,
+		})
+		providerLabel = string(detected)
+	}
+	return modelLabel, providerLabel, permissionLabel
+}
+
+func resolveSessionLabel(root, reference string) string {
+	if strings.TrimSpace(reference) == "" {
+		return "new"
+	}
+	session, err := sessions.LoadManaged(root, reference)
+	if err != nil {
+		if strings.EqualFold(reference, "latest") {
+			return "new"
+		}
+		return strings.TrimSpace(reference)
+	}
+	return session.Meta.SessionID
+}
+
+func latestSessionSummary(root string) repl.RecentSession {
+	summary, err := sessions.Latest(root)
+	if err != nil {
+		return repl.RecentSession{}
+	}
+	session, err := sessions.LoadManaged(root, summary.ID)
+	if err != nil {
+		return repl.RecentSession{
+			ID:           summary.ID,
+			MessageCount: summary.MessageCount,
+		}
+	}
+	recent := repl.RecentSession{
+		ID:           session.Meta.SessionID,
+		MessageCount: len(session.Messages),
+	}
+	if session.Meta.UpdatedAtMS > 0 {
+		recent.UpdatedLabel = "Updated " + time.UnixMilli(session.Meta.UpdatedAtMS).Format("Jan 2 15:04")
+	}
+	if count := len(session.Meta.PromptHistory); count > 0 {
+		recent.LastPrompt = strings.TrimSpace(session.Meta.PromptHistory[count-1].Text)
+	}
+	return recent
+}
+
+func fallbackString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func displayProvider(provider api.ProviderKind) string {
+	if provider == "" {
+		return "auto"
+	}
+	return string(provider)
 }
 
 func promptSpinnerLabel(phase hruntime.PromptPhase) string {
@@ -1172,8 +1488,7 @@ func (p stdioPrompter) Approve(_ string, _ string) (bool, error) {
 	if p.stdin == nil {
 		return false, nil
 	}
-	reader := bufio.NewReader(p.stdin)
-	line, err := reader.ReadString('\n')
+	line, err := readLine(p.stdin)
 	if err != nil && err != io.EOF {
 		return false, err
 	}
@@ -1182,6 +1497,98 @@ func (p stdioPrompter) Approve(_ string, _ string) (bool, error) {
 	}
 	line = strings.TrimSpace(strings.ToLower(line))
 	return line == "y" || line == "yes", nil
+}
+
+type readStringer interface {
+	ReadString(byte) (string, error)
+}
+
+type lineIO interface {
+	io.Reader
+	readStringer
+}
+
+type fileDescriptorCarrier interface {
+	Fd() uintptr
+}
+
+func readLine(reader io.Reader) (string, error) {
+	if reader == nil {
+		return "", io.EOF
+	}
+	if buffered, ok := reader.(readStringer); ok {
+		return buffered.ReadString('\n')
+	}
+	return bufio.NewReader(reader).ReadString('\n')
+}
+
+func sharedLineReader(reader io.Reader) lineIO {
+	if reader == nil {
+		return bufio.NewReader(strings.NewReader(""))
+	}
+	if buffered, ok := reader.(lineIO); ok {
+		return buffered
+	}
+	return bufio.NewReader(reader)
+}
+
+func splitInteractiveCommand(input string) ([]string, error) {
+	args := []string{}
+	var current strings.Builder
+	var quote rune
+	escaped := false
+	flush := func() {
+		if current.Len() == 0 {
+			return
+		}
+		args = append(args, current.String())
+		current.Reset()
+	}
+	for _, r := range input {
+		switch {
+		case escaped:
+			current.WriteRune(r)
+			escaped = false
+		case r == '\\':
+			escaped = true
+		case quote != 0:
+			if r == quote {
+				quote = 0
+			} else {
+				current.WriteRune(r)
+			}
+		case r == '\'' || r == '"':
+			quote = r
+		case r == ' ' || r == '\t':
+			flush()
+		default:
+			current.WriteRune(r)
+		}
+	}
+	if escaped {
+		return nil, fmt.Errorf("unterminated escape in slash command")
+	}
+	if quote != 0 {
+		return nil, fmt.Errorf("unterminated quoted string in slash command")
+	}
+	flush()
+	return args, nil
+}
+
+func isInteractiveStream(stream any) bool {
+	carrier, ok := stream.(fileDescriptorCarrier)
+	if !ok {
+		return false
+	}
+	file := os.NewFile(carrier.Fd(), "")
+	if file == nil {
+		return false
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func parseGlobalOptions(args []string) (globalOptions, []string, error) {
@@ -1298,6 +1705,7 @@ func printHelp(stdout io.Writer) {
 		"product": version.Product,
 		"version": version.Version,
 		"usage": []string{
+			"ascaris  # starts the interactive TUI when stdin is a TTY",
 			"ascaris [--model sonnet] [--provider anthropic] [--permission-mode workspace-write] [--output-format json] <prompt>",
 			"ascaris prompt <text>",
 			"ascaris security-review [--workflow auto|source|fuzz|binary] [--format markdown|json|both] [--scope path]",
@@ -1348,32 +1756,46 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	switch command {
 	case "/help":
 		_, _ = fmt.Fprintln(stdout, strings.Join([]string{
-			"Interactive slash commands:",
-			"- /review [scope]",
-			"- /security-review [scope]",
-			"- /bughunter [scope]",
-			"- /fuzz [scope]",
-			"- /crash-triage --target-cmd /path/to/binary --corpus corpus/",
-			"- /help",
-			"- /status",
-			"- /sandbox",
-			"- /config [section]",
-			"- /session [list|show <id>|switch <id>|fork [branch]|delete <id>|export [file]|clear]",
-			"- /resume <session-id|path>",
-			"- /compact",
-			"- /clear [--confirm]",
-			"- /export [file]",
-			"- /cost",
-			"- /login",
-			"- /logout",
-			"- /agents",
-			"- /skills [list|install <path>]",
-			"- /team [list|create <name>|delete <team-id>]",
-			"- /cron [list|add <schedule> <prompt>|remove <cron-id>]",
-			"- /worker [list|create <cwd>|get <worker-id>|observe <worker-id> <screen>|resolve-trust <worker-id>|await-ready <worker-id>|send-prompt <worker-id> [prompt]|restart <worker-id>|terminate <worker-id>]",
-			"- /plugin [list|install|enable|disable|uninstall|update]",
-			"- /mcp [list|show <server>]",
-			"- /state",
+			"## Bug Finding",
+			"/fuzz|[scope]|Fuzz-test a function or package",
+			"/security-review|[scope]|Full source security audit",
+			"/bughunter|[scope]|Logic and memory bug hunt",
+			"/review|[scope]|Inspect code for bugs",
+			"/crash-triage|--target-cmd <bin> --corpus <dir>|Triage crash reproducers",
+			"",
+			"## Model & Provider",
+			"/model|<model-name>|Switch model for this session",
+			"/provider|<name>|Switch provider (anthropic|openai|openrouter|xai|auto)",
+			"",
+			"## Session",
+			"/session|[list|show|switch|fork|delete|export|clear]|Manage sessions",
+			"/resume|<session-id|path>|Resume a saved session",
+			"/summary||Ask the model to summarize this session",
+			"/compact||Compact local session history",
+			"/clear|[--confirm]|Clear the active managed session alias",
+			"/export|[file]|Export session to file",
+			"",
+			"## Workspace & Info",
+			"/status||Show workspace and session status",
+			"/sandbox||Show sandbox isolation status",
+			"/config|[section]|Inspect merged config",
+			"/cost||Show cumulative token usage and estimated cost",
+			"/version||Show CLI version and build info",
+			"",
+			"## Auth",
+			"/login||Authenticate using OAuth",
+			"/logout||Clear saved OAuth credentials",
+			"",
+			"## Agents & Extensions",
+			"/agents|[--json]|Inspect available agents",
+			"/skills|[list|install <path>]|Inspect or install skills",
+			"/team|[list|create <name>|delete <id>]|Manage agent teams",
+			"/cron|[list|add <schedule> <prompt>|remove <id>]|Scheduled prompts",
+			"/worker|[list|create|get|observe|send-prompt|...]|Control coding workers",
+			"/plugin|[list|install|enable|disable|uninstall|update]|Manage plugins",
+			"/mcp|[list|show <server>]|Inspect MCP servers and tools",
+			"/state||Inspect worker and recovery state",
+			"/help||Show this command reference",
 		}, "\n"))
 		return 0
 	case "/status":
@@ -1429,10 +1851,11 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 		_, _ = fmt.Fprintf(stdout, "Session compacted: removed %d messages.\n", removed)
 		return 0
 	case "/clear":
-		if len(args) > 1 {
+		rest := args[1:]
+		if len(rest) > 1 {
 			return fail(stderr, fmt.Errorf("usage: /clear [--confirm]"))
 		}
-		if len(args) == 1 && args[0] != "--confirm" {
+		if len(rest) == 1 && rest[0] != "--confirm" {
 			return fail(stderr, fmt.Errorf("usage: /clear [--confirm]"))
 		}
 		if err := sessions.Clear(ctx.Root); err != nil {
@@ -1485,7 +1908,7 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	if strings.HasPrefix(command, "/oh-my-claudecode:") {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nCompatibility note: `%s` uses a legacy Claude Code/OMC plugin prefix. Import supported legacy assets with `ascaris migrate legacy`, then use the native `ascaris` command and plugin surface.", command, command))
 	}
-	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
+	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/model", "/provider", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
 	if suggestion != "" {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nDid you mean %s?", command, suggestion))
 	}

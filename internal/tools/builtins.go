@@ -44,6 +44,15 @@ type LiveContext struct {
 	PermissionMode  PermissionMode
 	AllowedToolName map[string]struct{}
 	Prompter        ApprovalPrompter
+	Activity        func(LiveToolEvent)
+}
+
+type LiveToolEvent struct {
+	Kind    string
+	Title   string
+	Summary string
+	Detail  string
+	Error   bool
 }
 
 func LiveDefinitions(allowedTools []string) []api.ToolDefinition {
@@ -139,6 +148,12 @@ func executeReadFile(ctx LiveContext, call LiveCall) LiveResult {
 	if err != nil {
 		return liveError(call, err.Error())
 	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "file_read",
+		Title:   input.Path,
+		Summary: "Reading file.",
+		Detail:  path,
+	})
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return liveError(call, err.Error())
@@ -164,6 +179,12 @@ func executeWriteFile(ctx LiveContext, call LiveCall) LiveResult {
 	if err != nil {
 		return liveError(call, err.Error())
 	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "file_write",
+		Title:   input.Path,
+		Summary: fmt.Sprintf("Writing %d bytes.", len(input.Content)),
+		Detail:  path,
+	})
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return liveError(call, err.Error())
 	}
@@ -174,6 +195,88 @@ func executeWriteFile(ctx LiveContext, call LiveCall) LiveResult {
 		"path":          path,
 		"bytes_written": len(input.Content),
 	})
+}
+
+// fileDiff is the payload written into the file_edit activity event Detail field.
+// The TUI parses this to render a proper unified diff with context lines.
+type fileDiff struct {
+	HunkHeader string   `json:"hunk"`
+	Before     []string `json:"before"` // context lines preceding the change
+	Removed    []string `json:"removed"`
+	Added      []string `json:"added"`
+	After      []string `json:"after"` // context lines following the change
+	StartLine  int      `json:"start_line"` // 1-indexed line where removed block begins
+}
+
+// buildUnifiedDiff computes a unified-diff hunk for a single exact-string replacement.
+// It reads the original content, locates oldStr, extracts ±3 context lines, and returns
+// a JSON-encoded fileDiff. Returns "" on any failure (caller falls back gracefully).
+func buildUnifiedDiff(content, oldStr, newStr string) string {
+	const ctxLines = 3
+	const maxHunkLines = 12 // cap removed/added shown; very large edits stay readable
+
+	idx := strings.Index(content, oldStr)
+	if idx < 0 {
+		return ""
+	}
+
+	allLines := strings.Split(content, "\n")
+	startLine := strings.Count(content[:idx], "\n") + 1 // 1-indexed
+	firstIdx := startLine - 1                           // 0-indexed into allLines
+	oldLineCount := strings.Count(oldStr, "\n") + 1
+
+	ctxStart := max(0, firstIdx-ctxLines)
+	lastOldIdx := firstIdx + oldLineCount - 1
+	ctxEnd := min(len(allLines)-1, lastOldIdx+ctxLines)
+
+	before := cloneLines(allLines[ctxStart:firstIdx])
+	removed := strings.Split(oldStr, "\n")
+	added := strings.Split(newStr, "\n")
+
+	afterStart := lastOldIdx + 1
+	var after []string
+	if afterStart <= ctxEnd && afterStart < len(allLines) {
+		after = cloneLines(allLines[afterStart : ctxEnd+1])
+	}
+
+	// Cap removed/added to keep the diff readable for massive edits.
+	truncatedRemoved := false
+	if len(removed) > maxHunkLines {
+		removed = append(removed[:maxHunkLines], fmt.Sprintf("… (%d more lines)", len(removed)-maxHunkLines))
+		truncatedRemoved = true
+	}
+	if len(added) > maxHunkLines && !truncatedRemoved {
+		added = append(added[:maxHunkLines], fmt.Sprintf("… (%d more lines)", len(added)-maxHunkLines))
+	}
+
+	// Unified diff hunk header: @@ -old_start,old_count +new_start,new_count @@
+	oldCount := len(before) + oldLineCount + len(after)
+	newLineCount := strings.Count(newStr, "\n") + 1
+	newCount := len(before) + newLineCount + len(after)
+	hunk := fmt.Sprintf("@@ -%d,%d +%d,%d @@", ctxStart+1, oldCount, ctxStart+1, newCount)
+
+	payload := fileDiff{
+		HunkHeader: hunk,
+		Before:     before,
+		Removed:    removed,
+		Added:      added,
+		After:      after,
+		StartLine:  startLine,
+	}
+	enc, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(enc)
+}
+
+func cloneLines(src []string) []string {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make([]string, len(src))
+	copy(dst, src)
+	return dst
 }
 
 func executeEditFile(ctx LiveContext, call LiveCall) LiveResult {
@@ -192,6 +295,8 @@ func executeEditFile(ctx LiveContext, call LiveCall) LiveResult {
 	if err != nil {
 		return liveError(call, err.Error())
 	}
+	// Read the file first so we can compute a real unified diff with context lines
+	// before emitting the activity event.
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return liveError(call, err.Error())
@@ -200,6 +305,17 @@ func executeEditFile(ctx LiveContext, call LiveCall) LiveResult {
 	if !strings.Contains(content, input.OldString) {
 		return liveError(call, "old_string was not found in file")
 	}
+	// Compute unified diff while we still have the original content.
+	diffDetail := buildUnifiedDiff(content, input.OldString, input.NewString)
+	if diffDetail == "" {
+		diffDetail = path // graceful fallback
+	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "file_edit",
+		Title:   input.Path,
+		Summary: "Editing " + input.Path,
+		Detail:  diffDetail,
+	})
 	updated := strings.Replace(content, input.OldString, input.NewString, 1)
 	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
 		return liveError(call, err.Error())
@@ -217,6 +333,12 @@ func executeGlobSearch(ctx LiveContext, call LiveCall) LiveResult {
 		return liveError(call, "invalid glob_search input: "+err.Error())
 	}
 	pattern := filepath.Join(ctx.Root, input.Pattern)
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "search",
+		Title:   "glob_search",
+		Summary: fmt.Sprintf("Expanding glob %s.", input.Pattern),
+		Detail:  pattern,
+	})
 	matches, err := filepath.Glob(pattern)
 	if err != nil {
 		return liveError(call, err.Error())
@@ -239,6 +361,12 @@ func executeGrepSearch(ctx LiveContext, call LiveCall) LiveResult {
 	if err != nil {
 		return liveError(call, err.Error())
 	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "search",
+		Title:   "grep_search",
+		Summary: fmt.Sprintf("Searching %s.", input.Path),
+		Detail:  fmt.Sprintf("pattern=%s", input.Pattern),
+	})
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return liveError(call, err.Error())
@@ -273,6 +401,12 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 		if ctx.Prompter == nil {
 			return liveError(call, "bash requires an approval prompter in workspace-write mode")
 		}
+		emitToolActivity(ctx, LiveToolEvent{
+			Kind:    "approval",
+			Title:   "bash",
+			Summary: "Awaiting approval for shell command.",
+			Detail:  input.Command,
+		})
 		approved, err := ctx.Prompter.Approve(call.Name, string(call.Input))
 		if err != nil {
 			return liveError(call, err.Error())
@@ -281,6 +415,12 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 			return liveError(call, "bash denied by user approval prompt")
 		}
 	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "bash_start",
+		Title:   "bash",
+		Summary: "Running shell command.",
+		Detail:  input.Command,
+	})
 	command := shellCommand(input.Command)
 	command.Dir = ctx.Root
 	var stdout bytes.Buffer
@@ -303,6 +443,13 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 	}
 	if exitCode != 0 {
 		data, _ := json.Marshal(output)
+		emitToolActivity(ctx, LiveToolEvent{
+			Kind:    "bash_result",
+			Title:   "bash",
+			Summary: fmt.Sprintf("Shell command exited with status %d.", exitCode),
+			Detail:  string(data),
+			Error:   true,
+		})
 		return LiveResult{
 			ToolUseID: call.ID,
 			Name:      call.Name,
@@ -310,6 +457,13 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 			IsError:   true,
 		}
 	}
+	data, _ := json.Marshal(output)
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "bash_result",
+		Title:   "bash",
+		Summary: "Shell command completed successfully.",
+		Detail:  string(data),
+	})
 	return liveJSON(call, output)
 }
 
@@ -359,4 +513,11 @@ func liveError(call LiveCall, message string) LiveResult {
 		Output:    message,
 		IsError:   true,
 	}
+}
+
+func emitToolActivity(ctx LiveContext, event LiveToolEvent) {
+	if ctx.Activity == nil {
+		return
+	}
+	ctx.Activity(event)
 }

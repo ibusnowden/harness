@@ -19,8 +19,12 @@ The active product is the Go CLI under [`cmd/ascaris`](./cmd/ascaris).
 go build -o ./bin/ascaris ./cmd/ascaris
 ./bin/ascaris doctor
 ./bin/ascaris status
+./bin/ascaris
 ./bin/ascaris prompt "summarize this repository"
+echo "summarize this repository" | ./bin/ascaris
 ```
+
+`./bin/ascaris` now starts an interactive terminal chat when run from a TTY. Explicit `prompt` and piped stdin continue to work as one-shot prompt modes.
 
 Run the Go test suite:
 
@@ -47,6 +51,7 @@ Ascaris stores config and runtime state under `.ascaris/` by default. Override t
 
 - [`USAGE.md`](./USAGE.md) — build/install and CLI usage
 - [`docs/prompt-e2e-stress-test.md`](./docs/prompt-e2e-stress-test.md) — prompt-first physical E2E stress-test runbook
+- [`docs/glm-cluster-deployment.md`](./docs/glm-cluster-deployment.md) — local GLM + vLLM + Ascaris deployment checklist
 - [`PARITY.md`](./PARITY.md) — current Go traceability and contract notes
 - [`ROADMAP.md`](./ROADMAP.md) — current product direction
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — product intent and operating model

@@ -184,7 +184,7 @@ func TestSlashCommandsAndConfigCompatibilityRun(t *testing.T) {
 		t.Fatalf("write local config: %v", err)
 	}
 
-	if code, stdout, stderr := runCLI(t, root, "/help"); code != 0 || !strings.Contains(stdout, "Interactive slash commands:") {
+	if code, stdout, stderr := runCLI(t, root, "/help"); code != 0 || !strings.Contains(stdout, "## Bug Finding") {
 		t.Fatalf("/help failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 	if code, stdout, stderr := runCLI(t, root, "/config", "model"); code != 0 || !strings.Contains(stdout, "Loaded files      3") || !strings.Contains(stdout, "opus") {

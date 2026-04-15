@@ -29,6 +29,7 @@ type PromptOptions struct {
 	AutoCompactInputTokens int
 	Prompter               tools.ApprovalPrompter
 	Progress               func(PromptProgress)
+	Activity               func(ActivityEvent)
 }
 
 type PromptPhase string
@@ -46,9 +47,22 @@ type PromptProgress struct {
 	ToolCount int         `json:"tool_count,omitempty"`
 }
 
+type ActivityEvent struct {
+	Kind      string `json:"kind"`
+	Title     string `json:"title"`
+	Summary   string `json:"summary"`
+	Detail    string `json:"detail,omitempty"`
+	Error     bool   `json:"error,omitempty"`
+	Iteration int    `json:"iteration,omitempty"`
+	EntryID   string `json:"entry_id,omitempty"`
+}
+
 type PromptSummary struct {
 	Message           string             `json:"message"`
 	Model             string             `json:"model"`
+	RequestModel      string             `json:"request_model,omitempty"`
+	Provider          string             `json:"provider,omitempty"`
+	TurnID            string             `json:"turn_id,omitempty"`
 	Iterations        int                `json:"iterations"`
 	AutoCompaction    *AutoCompaction    `json:"auto_compaction"`
 	ToolUses          []ToolUseRecord    `json:"tool_uses"`
@@ -89,7 +103,9 @@ func NewLiveHarness(root string) (*LiveHarness, error) {
 
 func DefaultPromptOptions() PromptOptions {
 	return PromptOptions{
-		Model:          "sonnet",
+		// Model has no hardcoded default — it must come from .ascaris/settings.json
+		// (model field) or be passed explicitly via CLI flag / /model command.
+		Model:          "",
 		PermissionMode: tools.PermissionWorkspaceWrite,
 		MaxIterations:  8,
 		MaxTokens:      4096,
@@ -101,11 +117,20 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		return PromptSummary{}, fmt.Errorf("prompt text is required")
 	}
 	opts = withPromptDefaults(opts, h.Config)
+	if strings.TrimSpace(opts.Model) == "" {
+		return PromptSummary{}, fmt.Errorf(
+			"no model configured\n\n" +
+				"Set the model in .ascaris/settings.json:\n" +
+				"  {\"model\": \"thudm/glm-4-9b\", \"provider\": {\"kind\": \"openrouter\"}}\n\n" +
+				"Or switch model in the TUI with: /model <name>\n" +
+				"Examples: /model thudm/glm-4-9b  /model anthropic/claude-sonnet-4-6  /model openai/gpt-4o",
+		)
+	}
 	session, err := h.loadOrCreateSession(opts)
 	if err != nil {
 		return PromptSummary{}, err
 	}
-	client, err := api.NewProviderClient(resolveModel(opts.Model), api.ProviderConfig{
+	providerCfg := api.ProviderConfig{
 		AnthropicBaseURL:  h.Config.ProviderSettings().AnthropicBaseURL,
 		OpenAIBaseURL:     h.Config.ProviderSettings().OpenAIBaseURL,
 		OpenRouterBaseURL: h.Config.ProviderSettings().OpenRouterBaseURL,
@@ -114,14 +139,19 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		ProxyURL:          h.Config.ProviderSettings().ProxyURL,
 		ConfigHome:        config.ConfigHome(h.Root),
 		OAuthSettings:     h.Config.OAuth(),
-	})
-	if err != nil {
-		return PromptSummary{}, err
 	}
+	client, err := api.NewProviderClient(resolveModel(opts.Model), providerCfg)
+	if err != nil {
+		return PromptSummary{}, fmt.Errorf("%w\n\nSet a provider API key: OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or XAI_API_KEY", err)
+	}
+	// Compute the model name as the chosen provider expects it (e.g. OpenRouter
+	// requires "anthropic/claude-sonnet-4-6" rather than "claude-sonnet-4-6").
+	requestModel := resolvedModelForClient(resolveModel(opts.Model), client)
 	cache := promptcache.New(h.Root, session.Meta.SessionID)
 	autoCompaction := applyAutoCompaction(&session, effectiveAutoCompactThreshold(opts))
 	session.RecordPrompt(prompt)
 	session.Messages = append(session.Messages, api.UserTextMessage(prompt))
+	promptTurnID := fmt.Sprintf("%s-turn-%d", session.Meta.SessionID, len(session.Messages))
 	session.Meta.Model = opts.Model
 	liveRuntime, err := newLiveRuntime(h.Root, h.Config, opts, prompt)
 	if err != nil {
@@ -130,6 +160,9 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 	defer liveRuntime.close()
 	summary := PromptSummary{
 		Model:             opts.Model,
+		RequestModel:      requestModel,
+		Provider:          string(client.ProviderKind()),
+		TurnID:            promptTurnID,
 		AutoCompaction:    autoCompaction,
 		ToolUses:          []ToolUseRecord{},
 		ToolResults:       []tools.LiveResult{},
@@ -137,13 +170,24 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		SessionID:         session.Meta.SessionID,
 	}
 	emitPromptProgress(opts, PromptProgress{Phase: PromptPhaseStarting})
+	emitActivity(opts, ActivityEvent{
+		Kind:    "status",
+		Title:   "Starting",
+		Summary: "Preparing the runtime and session state.",
+	})
 	for iteration := 0; iteration < max(1, opts.MaxIterations); iteration++ {
 		emitPromptProgress(opts, PromptProgress{
 			Phase:     PromptPhaseWaitingModel,
 			Iteration: iteration + 1,
 		})
+		emitActivity(opts, ActivityEvent{
+			Kind:      "model",
+			Title:     "Thinking",
+			Summary:   fmt.Sprintf("Waiting for model output on iteration %d.", iteration+1),
+			Iteration: iteration + 1,
+		})
 		request := api.MessageRequest{
-			Model:     resolveModel(opts.Model),
+			Model:     requestModel,
 			MaxTokens: max(256, opts.MaxTokens),
 			Messages:  append([]api.InputMessage(nil), session.Messages...),
 			System:    defaultSystemPrompt(),
@@ -153,8 +197,16 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		response, event, ok := cache.Lookup(request)
 		if ok {
 			summary.PromptCacheEvents = append(summary.PromptCacheEvents, event)
+			emitActivity(opts, ActivityEvent{
+				Kind:      "cache",
+				Title:     "Prompt Cache",
+				Summary:   "Reused a cached model response for this turn.",
+				Detail:    compactJSON(json.RawMessage(summaryJSON(event))),
+				Iteration: iteration + 1,
+			})
 		} else {
-			response, err = liveRuntime.StreamMessage(ctx, client, request)
+			streamState := newLiveStreamState(promptTurnID, iteration+1, opts)
+			response, err = liveRuntime.StreamMessage(ctx, client, request, streamState.Handle)
 			if err != nil {
 				return PromptSummary{}, err
 			}
@@ -164,6 +216,14 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		}
 		summary.Iterations++
 		session.Meta.Usage = session.Meta.Usage.Add(response.Usage)
+		if containsThinkingContent(response) {
+			emitActivity(opts, ActivityEvent{
+				Kind:      "model",
+				Title:     "Thinking",
+				Summary:   "Model reasoning content was received.",
+				Iteration: iteration + 1,
+			})
+		}
 		assistantMessage := assistantMessageFromResponse(response)
 		session.Messages = append(session.Messages, assistantMessage)
 		liveCalls := collectToolCalls(response)
@@ -177,6 +237,12 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		if len(liveCalls) == 0 {
 			emitPromptProgress(opts, PromptProgress{
 				Phase:     PromptPhaseFinalizing,
+				Iteration: iteration + 1,
+			})
+			emitActivity(opts, ActivityEvent{
+				Kind:      "status",
+				Title:     "Finalizing",
+				Summary:   "Preparing the final assistant response.",
 				Iteration: iteration + 1,
 			})
 			summary.Message = response.FinalText()
@@ -194,8 +260,23 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		})
 		envelopes := make([]api.ToolResultEnvelope, 0, len(liveCalls))
 		for _, call := range liveCalls {
+			emitActivity(opts, ActivityEvent{
+				Kind:      "tool_start",
+				Title:     call.Name,
+				Summary:   fmt.Sprintf("Invoking %s.", call.Name),
+				Detail:    compactJSON(call.Input),
+				Iteration: iteration + 1,
+			})
 			result := liveRuntime.ExecuteTool(ctx, call)
 			summary.ToolResults = append(summary.ToolResults, result)
+			emitActivity(opts, ActivityEvent{
+				Kind:      "tool_result",
+				Title:     result.Name,
+				Summary:   summarizeToolResult(result),
+				Detail:    result.Output,
+				Error:     result.IsError,
+				Iteration: iteration + 1,
+			})
 			envelopes = append(envelopes, api.ToolResultEnvelope{
 				ToolUseID: result.ToolUseID,
 				Output:    result.Output,
@@ -207,6 +288,13 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 	emitPromptProgress(opts, PromptProgress{
 		Phase:     PromptPhaseFinalizing,
 		Iteration: summary.Iterations,
+	})
+	emitActivity(opts, ActivityEvent{
+		Kind:      "status",
+		Title:     "Stopped",
+		Summary:   "The turn loop ended before a final assistant response was produced.",
+		Iteration: summary.Iterations,
+		Error:     true,
 	})
 	summary.Usage = session.Meta.Usage
 	summary.EstimatedCost = formatUSD(estimateCost(session.Meta.Usage, opts.Model))
@@ -224,6 +312,167 @@ func emitPromptProgress(opts PromptOptions, progress PromptProgress) {
 		return
 	}
 	opts.Progress(progress)
+}
+
+func emitActivity(opts PromptOptions, activity ActivityEvent) {
+	if opts.Activity == nil {
+		return
+	}
+	opts.Activity(activity)
+}
+
+func summarizeToolResult(result tools.LiveResult) string {
+	if result.IsError {
+		return fmt.Sprintf("%s returned an error.", result.Name)
+	}
+	return fmt.Sprintf("%s completed successfully.", result.Name)
+}
+
+func activityForToolEvent(event tools.LiveToolEvent, iteration int) ActivityEvent {
+	return ActivityEvent{
+		Kind:      event.Kind,
+		Title:     event.Title,
+		Summary:   event.Summary,
+		Detail:    event.Detail,
+		Error:     event.Error,
+		Iteration: iteration,
+	}
+}
+
+type liveStreamState struct {
+	turnID    string
+	iteration int
+	opts      PromptOptions
+	text      strings.Builder
+	toolCalls map[int]*liveToolCallState
+}
+
+type liveToolCallState struct {
+	id    string
+	name  string
+	input strings.Builder
+}
+
+func newLiveStreamState(turnID string, iteration int, opts PromptOptions) *liveStreamState {
+	return &liveStreamState{
+		turnID:    turnID,
+		iteration: iteration,
+		opts:      opts,
+		toolCalls: map[int]*liveToolCallState{},
+	}
+}
+
+func (s *liveStreamState) Handle(event api.StreamEvent) {
+	switch event.Type {
+	case "text_delta":
+		if strings.TrimSpace(event.Text) == "" {
+			return
+		}
+		s.text.WriteString(event.Text)
+		emitActivity(s.opts, ActivityEvent{
+			Kind:      "result_stream",
+			Title:     "Result",
+			Detail:    s.text.String(),
+			Iteration: s.iteration,
+			EntryID:   s.entryID("result"),
+		})
+	case "tool_call_delta":
+		call := s.toolCalls[event.ToolCallIndex]
+		if call == nil {
+			call = &liveToolCallState{}
+			s.toolCalls[event.ToolCallIndex] = call
+		}
+		if strings.TrimSpace(event.ToolCallID) != "" {
+			call.id = event.ToolCallID
+		}
+		if strings.TrimSpace(event.ToolName) != "" {
+			call.name = event.ToolName
+		}
+		if event.ToolInputDelta != "" {
+			call.input.WriteString(event.ToolInputDelta)
+		}
+		emitActivity(s.opts, ActivityEvent{
+			Kind:      "tool_call_delta",
+			Title:     firstNonEmptyString(call.name, "Tool Call"),
+			Summary:   "Forming tool call.",
+			Detail:    renderToolCallPreview(call.id, call.name, call.input.String()),
+			Iteration: s.iteration,
+			EntryID:   s.entryID(fmt.Sprintf("tool-call-%d", event.ToolCallIndex)),
+		})
+	case "tool_call_ready":
+		call := s.toolCalls[event.ToolCallIndex]
+		name := event.ToolName
+		inputPreview := ""
+		if call != nil {
+			if name == "" {
+				name = call.name
+			}
+			inputPreview = call.input.String()
+		}
+		if len(event.ToolInput) > 0 {
+			inputPreview = compactJSON(event.ToolInput)
+		}
+		emitActivity(s.opts, ActivityEvent{
+			Kind:      "tool_call_ready",
+			Title:     firstNonEmptyString(name, "Tool Call"),
+			Summary:   "Tool call ready.",
+			Detail:    renderToolCallPreview(event.ToolCallID, name, inputPreview),
+			Iteration: s.iteration,
+			EntryID:   s.entryID(fmt.Sprintf("tool-call-%d", event.ToolCallIndex)),
+		})
+	case "thinking_delta":
+		emitActivity(s.opts, ActivityEvent{
+			Kind:      "model",
+			Title:     "Thinking",
+			Summary:   "Model reasoning content was received.",
+			Iteration: s.iteration,
+			EntryID:   s.entryID("thinking"),
+		})
+	}
+}
+
+func (s *liveStreamState) entryID(suffix string) string {
+	return fmt.Sprintf("%s-iter-%d-%s", s.turnID, s.iteration, suffix)
+}
+
+func renderToolCallPreview(id, name, input string) string {
+	lines := []string{}
+	if strings.TrimSpace(id) != "" {
+		lines = append(lines, "id="+strings.TrimSpace(id))
+	}
+	if strings.TrimSpace(name) != "" {
+		lines = append(lines, "name="+strings.TrimSpace(name))
+	}
+	if strings.TrimSpace(input) != "" {
+		lines = append(lines, strings.TrimSpace(input))
+	}
+	return strings.Join(lines, "\n")
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
+}
+
+func summaryJSON(value any) string {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return "{}"
+	}
+	return string(data)
+}
+
+func containsThinkingContent(response api.MessageResponse) bool {
+	for _, block := range response.Content {
+		if block.Type == "thinking" && strings.TrimSpace(block.Thinking) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func (s PromptSummary) JSON() string {
@@ -304,17 +553,37 @@ func defaultSystemPrompt() string {
 	}, "\n\n")
 }
 
+// resolveModel expands short aliases to their full model names.
+// An empty string is returned as-is — callers must validate before use.
+// Short Claude aliases (sonnet/opus/haiku) still work and will be routed
+// through OpenRouter as anthropic/claude-* when ANTHROPIC_API_KEY is absent.
 func resolveModel(model string) string {
 	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "", "sonnet":
+	case "sonnet":
 		return "claude-sonnet-4-6"
 	case "opus":
 		return "claude-opus-4-6"
 	case "haiku":
 		return "claude-haiku-4-5"
 	default:
+		return strings.TrimSpace(model)
+	}
+}
+
+// resolvedModelForClient maps a canonical model name to the format expected
+// by the given client. OpenRouter requires provider-prefixed slugs such as
+// "anthropic/claude-sonnet-4-6"; all other clients use the name as-is.
+func resolvedModelForClient(model string, client api.MessageClient) string {
+	if client.ProviderKind() != api.ProviderOpenRouter {
 		return model
 	}
+	if strings.Contains(model, "/") {
+		return model // already prefixed, e.g. "openai/gpt-4o"
+	}
+	if strings.HasPrefix(model, "claude-") {
+		return "anthropic/" + model
+	}
+	return model
 }
 
 func estimateCost(usage api.Usage, model string) float64 {
@@ -349,7 +618,7 @@ func costForTokens(tokens int, usdPerMillion float64) float64 {
 }
 
 func formatUSD(amount float64) string {
-	return fmt.Sprintf("$%.4f", amount)
+	return fmt.Sprintf("$%.2f", amount)
 }
 
 func applyAutoCompaction(session *sessions.ManagedSession, threshold int) *AutoCompaction {

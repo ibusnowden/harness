@@ -30,11 +30,10 @@ func TestDefaultPromptPhrasesRemainDefensive(t *testing.T) {
 		}
 	}
 	expected := []string{
-		"Bombaclatt",
-		"Paibraniang",
 		"Fuzzing",
-		"fkTheyTalkingAbout",
-		"Start-living",
+		"Scanning",
+		"Triaging",
+		"Delivering",
 	}
 	for _, item := range expected {
 		found := false

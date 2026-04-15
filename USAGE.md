@@ -24,8 +24,12 @@ For a stripped local release build:
 ./bin/ascaris doctor
 ./bin/ascaris status
 ./bin/ascaris login
+./bin/ascaris
 ./bin/ascaris prompt "summarize this repository"
+echo "summarize this repository" | ./bin/ascaris
 ```
+
+`./bin/ascaris` starts the interactive TUI when stdin is a TTY. Use `prompt` or piped stdin for one-shot turns.
 
 ## Sessions And State
 
@@ -71,3 +75,5 @@ GOCACHE="$(pwd)/.cache/go-build" go test ./...
 ```
 
 For a physical prompt-first terminal validation pass, use [`docs/prompt-e2e-stress-test.md`](./docs/prompt-e2e-stress-test.md).
+
+For local GLM + vLLM serving and harness bring-up, use [`docs/glm-cluster-deployment.md`](./docs/glm-cluster-deployment.md) and `scripts/smoke_glm_ascaris.sh`.
