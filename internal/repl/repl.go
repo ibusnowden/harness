@@ -247,7 +247,8 @@ type model struct {
 	startupNote  string
 	entrySeq     int
 
-	comp completion
+	comp        completion
+	pasteBlocks []string // full content of each paste block; index+1 = block number
 
 	theme Theme
 	md    *markdownRenderer
@@ -375,8 +376,9 @@ func applyTextareaTheme(input *textarea.Model) {
 }
 
 func (m model) Init() tea.Cmd {
-	// Only start the cursor blink; spinner only fires when m.busy becomes true.
-	return textarea.Blink
+	// Enable bracketed paste so we can detect pasted content and show a compact
+	// placeholder instead of dumping raw text into the input line.
+	return tea.Batch(textarea.Blink, tea.EnableBracketedPaste)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -475,6 +477,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Intercept bracketed paste before it reaches the textarea.
+	if msg.Paste {
+		return m.handlePaste(msg.String())
+	}
 	if m.approval != nil {
 		switch msg.String() {
 		case "y", "Y":
@@ -639,6 +645,50 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, cmd
 }
 
+// expandPastePlaceholders replaces [Pasted text #N +M lines] tokens in s with
+// the stored full content from m.pasteBlocks.
+func (m model) expandPastePlaceholders(s string) string {
+	for i, content := range m.pasteBlocks {
+		extra := strings.Count(content, "\n")
+		placeholder := pasteBlockPlaceholder(i+1, extra)
+		s = strings.ReplaceAll(s, placeholder, content)
+	}
+	return s
+}
+
+// handlePaste handles a bracketed-paste event. Short pastes are inserted
+// directly; long pastes are stored and replaced with a compact placeholder:
+//
+//	[Pasted text #1 +15 lines]
+//
+// The placeholder is expanded back to the full content at submit time.
+func (m model) handlePaste(text string) (tea.Model, tea.Cmd) {
+	const longLines = 3
+	const longChars = 150
+
+	lineCount := strings.Count(text, "\n") + 1
+	if lineCount <= longLines && len(text) <= longChars {
+		// Short paste — insert as-is.
+		m.input.InsertString(text)
+		m.updateCompletion()
+		return m, nil
+	}
+
+	// Long paste — store full content and insert a compact pill.
+	m.pasteBlocks = append(m.pasteBlocks, text)
+	n := len(m.pasteBlocks)
+	extra := lineCount - 1
+	placeholder := fmt.Sprintf("[Pasted text #%d +%d lines]", n, extra)
+	m.input.InsertString(placeholder)
+	m.updateCompletion()
+	return m, nil
+}
+
+// pasteBlockPlaceholder returns the placeholder string for paste block n (1-indexed).
+func pasteBlockPlaceholder(n, extraLines int) string {
+	return fmt.Sprintf("[Pasted text #%d +%d lines]", n, extraLines)
+}
+
 func (m model) submitInput() (tea.Model, tea.Cmd) {
 	line := strings.TrimSpace(m.input.Value())
 	if line == "" {
@@ -664,6 +714,7 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 			m.activities = nil
 			m.expanded = map[int]bool{}
 			m.selectedActivity = 0
+			m.pasteBlocks = nil
 			m.status.SessionID = "new"
 			m.startupNote = strings.TrimSpace(result.Output)
 			if strings.TrimSpace(result.Output) == "" {
@@ -726,8 +777,11 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 		m.appendTranscript("Run State", "A turn is already running. Wait for completion before sending another prompt.", "system")
 		return m, nil
 	}
-	prompt := m.input.Value()
+	rawPrompt := m.input.Value()
+	// Expand paste placeholders back to their full content before submitting.
+	prompt := m.expandPastePlaceholders(rawPrompt)
 	m.input.Reset()
+	m.pasteBlocks = nil // placeholders consumed; reset for next turn
 	m.startupNote = ""
 	m.appendTranscript("Run Request", prompt, "task")
 	m.recordActivity(activityRecord{
