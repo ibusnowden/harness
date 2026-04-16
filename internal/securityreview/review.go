@@ -546,7 +546,8 @@ func collectSourceFiles(scopePath string) ([]string, error) {
 		name := d.Name()
 		if d.IsDir() {
 			switch name {
-			case ".git", ".cache", ".ascaris", "bin", "vendor", "node_modules", "testdata":
+			case ".git", ".cache", ".ascaris", "bin", "vendor", "node_modules", "testdata",
+				"securityreview": // skip the scanner's own package to avoid self-referential false positives
 				return filepath.SkipDir
 			}
 			return nil
@@ -573,7 +574,7 @@ func analyzeFile(root, path string) ([]Finding, error) {
 	rel := filepath.ToSlash(mustRelative(root, path))
 	findings := []Finding{}
 
-	if match := insecureSkipVerifyPattern.FindStringIndex(content); match != nil {
+	if match := insecureSkipVerifyPattern.FindStringIndex(content); match != nil && !guardedTLSSkipVerify(content, match[0]) {
 		findings = append(findings, Finding{
 			ID:           findingID("tls-skip-verify", rel, lineNumber(content, match[0])),
 			Title:        "TLS verification disabled in production code path",
@@ -678,6 +679,63 @@ func guardedShellExecution(content string) bool {
 		}
 	}
 	return false
+}
+
+// guardedTLSSkipVerify returns true when the InsecureSkipVerify match at matchStart
+// is a false positive — i.e. it appears inside a string literal, raw string, comment,
+// or a regexp.MustCompile/regexp.Compile call rather than live struct-field assignment.
+//
+// This mirrors guardedShellExecution but uses position-aware string-literal detection
+// because the TLS pattern is commonly found inside scanner rule definitions and
+// patch guidance strings.
+func guardedTLSSkipVerify(content string, matchStart int) bool {
+	// Extract the line containing the match.
+	lineStart := strings.LastIndex(content[:matchStart], "\n") + 1
+	lineEnd := matchStart + strings.Index(content[matchStart:], "\n")
+	if lineEnd < matchStart {
+		lineEnd = len(content)
+	}
+	line := content[lineStart:lineEnd]
+	trimmed := strings.TrimSpace(line)
+
+	// Skip commented-out lines.
+	if strings.HasPrefix(trimmed, "//") {
+		return true
+	}
+
+	// Skip regex/pattern definition lines — the pattern string itself matches.
+	if strings.Contains(line, "regexp.MustCompile") || strings.Contains(line, "regexp.Compile") {
+		return true
+	}
+
+	// Skip when the match position is inside a string literal (double-quoted or
+	// raw backtick). Scanning from the file start handles multi-line raw strings.
+	return isInsideStringLiteral(content[:matchStart])
+}
+
+// isInsideStringLiteral reports whether position s (the prefix of the file up to the
+// match) ends inside a Go string literal — either a double-quoted string or a raw
+// backtick string. It handles escaped characters inside double-quoted strings.
+func isInsideStringLiteral(s string) bool {
+	inDouble := false
+	inBack := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\':
+			if inDouble {
+				i++ // skip the escaped character
+			}
+		case '"':
+			if !inBack {
+				inDouble = !inDouble
+			}
+		case '`':
+			if !inDouble {
+				inBack = !inBack
+			}
+		}
+	}
+	return inDouble || inBack
 }
 
 func runDeterministicCheck(root, scopePath string, timeout time.Duration) (CommandRun, bool) {
