@@ -181,6 +181,7 @@ var slashRegistry = []slashItem{
 	{"/provider", "Switch provider for this session"},
 	{"/summary", "Ask the model to summarize this session"},
 	{"/plan", "Ask the model to produce a numbered implementation plan"},
+	{"/proceed", "Approve the plan and begin executing all tasks"},
 	{"/memory", "View, add, or clear persistent workspace memory notes"},
 	{"/commit", "Generate a conventional commit message from staged changes and commit"},
 }

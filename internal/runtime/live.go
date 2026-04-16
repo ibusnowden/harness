@@ -108,7 +108,7 @@ func DefaultPromptOptions() PromptOptions {
 		// (model field) or be passed explicitly via CLI flag / /model command.
 		Model:          "",
 		PermissionMode: tools.PermissionWorkspaceWrite,
-		MaxIterations:  8,
+		MaxIterations:  32,
 		MaxTokens:      4096,
 	}
 }
@@ -625,6 +625,21 @@ func defaultSystemPrompt() string {
 			"Git credentials, SSH keys, and credential helpers configured on the host machine are automatically available — do not refuse git operations on the grounds of missing credentials. " +
 			"Attempt the command and report the actual output, success or failure. " +
 			"For potentially destructive git operations (force push, branch deletion, reset --hard), confirm with the user before running.",
+
+		// Agentic Task Execution
+		"## Agentic Task Execution\n" +
+			"When the user approves a plan (responds with 'yes', 'proceed', 'go ahead', 'begin', '/proceed', or any equivalent confirmation), " +
+			"you MUST immediately begin executing the task list. Do not re-explain the plan or ask for further confirmation.\n\n" +
+			"Execution protocol — repeat until all tasks are done:\n" +
+			"1. Call task_list() to get the current task state.\n" +
+			"2. Find the first task with status 'open' that is not blocked (all its blocked_by tasks are 'done').\n" +
+			"3. Call task_update(id, 'in_progress') to mark it started.\n" +
+			"4. Implement the task fully: read relevant files, write or edit code, run tests with bash.\n" +
+			"5. Call task_update(id, 'done') once the work is complete and verified.\n" +
+			"6. Move immediately to the next open task — do NOT pause between tasks to ask permission.\n" +
+			"7. Only stop and ask the user if you hit a genuine blocker that cannot be resolved with available tools.\n\n" +
+			"This is the core execution loop. A task is only 'done' when the actual code change has been made and verified, " +
+			"not when you have described what to do. Write real code, edit real files, run real commands.",
 	}, "\n\n")
 }
 

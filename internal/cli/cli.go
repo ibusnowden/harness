@@ -925,23 +925,38 @@ func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashRe
 			if taskDesc == "" {
 				taskDesc = "the task described in this conversation"
 			}
-			prompt := "You are planning work for this workspace. Follow these steps exactly:\n\n" +
+			prompt := "You are planning work for this workspace. Follow these two steps:\n\n" +
 				"## Step 1 — Read the workspace\n" +
-				"Run these bash commands to understand the current state:\n" +
+				"Run these bash commands:\n" +
 				"  git ls-files | head -60\n" +
 				"  git status --short\n\n" +
 				"## Step 2 — Create tasks\n" +
-				"Use the task_create tool to break down this task into concrete, numbered subtasks:\n\n  " + taskDesc + "\n\n" +
-				"Rules for task creation:\n" +
-				"- Each task must be a single, actionable unit of work\n" +
-				"- Set blocked_by to the IDs of tasks that must complete first\n" +
-				"- Keep titles under 72 chars\n" +
-				"- Do NOT start implementing yet\n\n" +
-				"## Step 3 — Ask for approval\n" +
-				"After creating all tasks, output a short summary of the plan and ask:\n" +
-				"\"Shall I begin with task #1, or would you like to adjust the plan?\""
+				"Use the task_create tool to break down this task into concrete, actionable subtasks:\n\n  " + taskDesc + "\n\n" +
+				"Rules:\n" +
+				"- Each task is one actionable unit of work\n" +
+				"- Set blocked_by to IDs of prerequisite tasks\n" +
+				"- Keep titles under 72 chars\n\n" +
+				"## Step 3 — Present and ask\n" +
+				"After creating all tasks, show a one-line summary of each task and ask the user:\n" +
+				"\"Plan ready. Type /proceed to implement all tasks, or tell me what to change.\"\n\n" +
+				"Do NOT begin implementing yet — wait for the user to type /proceed or give feedback."
 			return repl.SlashResult{
 				Output:    "Reading workspace and building task list…",
+				RunPrompt: prompt,
+			}
+		case "/proceed":
+			prompt := "The user has approved the plan. Begin executing now.\n\n" +
+				"Follow the Agentic Task Execution protocol from the system prompt:\n" +
+				"1. Call task_list() to see current tasks.\n" +
+				"2. Work through each open, unblocked task in order:\n" +
+				"   - task_update(id, 'in_progress')\n" +
+				"   - Implement: write/edit real files, run bash commands, verify the result\n" +
+				"   - task_update(id, 'done')\n" +
+				"3. Do not pause between tasks to ask permission.\n" +
+				"4. Only stop if you hit a genuine blocker you cannot resolve.\n\n" +
+				"Start immediately with task #1."
+			return repl.SlashResult{
+				Output:    "Executing plan…",
 				RunPrompt: prompt,
 			}
 		case "/memory":
@@ -1991,7 +2006,7 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	if strings.HasPrefix(command, "/oh-my-claudecode:") {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nCompatibility note: `%s` uses a legacy Claude Code/OMC plugin prefix. Import supported legacy assets with `ascaris migrate legacy`, then use the native `ascaris` command and plugin surface.", command, command))
 	}
-	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/model", "/provider", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state", "/plan", "/memory", "/commit", "/summary"})
+	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/model", "/provider", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state", "/plan", "/proceed", "/memory", "/commit", "/summary"})
 	if suggestion != "" {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nDid you mean %s?", command, suggestion))
 	}
