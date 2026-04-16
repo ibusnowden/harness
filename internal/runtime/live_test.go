@@ -86,17 +86,143 @@ func TestLiveHarnessRunPromptEmitsProgressForToolTurn(t *testing.T) {
 	assertPromptPhases(t, phases, expected)
 }
 
+func TestLiveHarnessRunPromptEmitsActivityForToolTurn(t *testing.T) {
+	restoreTransport := api.SetTransportForTesting(mockanthropic.NewTransport())
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://mock.anthropic.local")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+	if err := os.WriteFile(filepath.Join(root, "fixture.txt"), []byte("alpha parity line\n"), 0o644); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	harness, err := NewLiveHarness(root)
+	if err != nil {
+		t.Fatalf("new live harness: %v", err)
+	}
+	var activities []ActivityEvent
+	_, err = harness.RunPrompt(context.Background(), mockanthropic.ScenarioPrefix+"read_file_roundtrip", PromptOptions{
+		Model:          "sonnet",
+		PermissionMode: tools.PermissionWorkspaceWrite,
+		Activity: func(activity ActivityEvent) {
+			activities = append(activities, activity)
+		},
+	})
+	if err != nil {
+		t.Fatalf("run prompt: %v", err)
+	}
+	if len(activities) == 0 {
+		t.Fatalf("expected activity events")
+	}
+	if !containsActivityKind(activities, "tool_start") || !containsActivityKind(activities, "tool_result") {
+		t.Fatalf("expected tool activity events, got %#v", activities)
+	}
+	if !containsActivityKind(activities, "file_read") {
+		t.Fatalf("expected file_read activity event, got %#v", activities)
+	}
+	if !containsActivityKind(activities, "tool_call_delta") || !containsActivityKind(activities, "tool_call_ready") {
+		t.Fatalf("expected streamed tool call formation events, got %#v", activities)
+	}
+}
+
+func TestLiveHarnessRunPromptEmitsStreamingResultActivity(t *testing.T) {
+	restoreTransport := api.SetTransportForTesting(mockanthropic.NewTransport())
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://mock.anthropic.local")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+
+	harness, err := NewLiveHarness(root)
+	if err != nil {
+		t.Fatalf("new live harness: %v", err)
+	}
+	var activities []ActivityEvent
+	_, err = harness.RunPrompt(context.Background(), mockanthropic.ScenarioPrefix+"streaming_text", PromptOptions{
+		Model:          "sonnet",
+		PermissionMode: tools.PermissionWorkspaceWrite,
+		Activity: func(activity ActivityEvent) {
+			activities = append(activities, activity)
+		},
+	})
+	if err != nil {
+		t.Fatalf("run prompt: %v", err)
+	}
+	if !containsActivityKind(activities, "result_stream") {
+		t.Fatalf("expected result_stream activity, got %#v", activities)
+	}
+}
+
+func TestLiveHarnessUsesDistinctStreamEntryIDsAcrossTurns(t *testing.T) {
+	restoreTransport := api.SetTransportForTesting(mockanthropic.NewTransport())
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://mock.anthropic.local")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+
+	harness, err := NewLiveHarness(root)
+	if err != nil {
+		t.Fatalf("new live harness: %v", err)
+	}
+
+	var firstActivities []ActivityEvent
+	firstSummary, err := harness.RunPrompt(context.Background(), mockanthropic.ScenarioPrefix+"streaming_text", PromptOptions{
+		Model:          "sonnet",
+		PermissionMode: tools.PermissionWorkspaceWrite,
+		Activity: func(activity ActivityEvent) {
+			firstActivities = append(firstActivities, activity)
+		},
+	})
+	if err != nil {
+		t.Fatalf("first run prompt: %v", err)
+	}
+
+	var secondActivities []ActivityEvent
+	_, err = harness.RunPrompt(context.Background(), mockanthropic.ScenarioPrefix+"streaming_text", PromptOptions{
+		Model:          "sonnet",
+		PermissionMode: tools.PermissionWorkspaceWrite,
+		ResumeSession:  firstSummary.SessionID,
+		Activity: func(activity ActivityEvent) {
+			secondActivities = append(secondActivities, activity)
+		},
+	})
+	if err != nil {
+		t.Fatalf("second run prompt: %v", err)
+	}
+
+	firstResultID := firstActivityEntryID(firstActivities, "result_stream")
+	secondResultID := firstActivityEntryID(secondActivities, "result_stream")
+	if firstResultID == "" || secondResultID == "" {
+		t.Fatalf("expected result stream entry ids, got first=%q second=%q", firstResultID, secondResultID)
+	}
+	if firstResultID == secondResultID {
+		t.Fatalf("expected distinct turn-scoped result ids, got %q", firstResultID)
+	}
+}
+
 func TestDefaultSystemPromptIncludesHarnessGuardrails(t *testing.T) {
 	prompt := defaultSystemPrompt()
 	required := []string{
 		"stop and ask instead of guessing",
 		"Treat user explanations and root-cause guesses as hypotheses, not facts.",
 		"follow the evidence",
-		"Read the relevant files before editing",
-		"Do not perform destructive or irreversible actions without the user's explicit approval.",
+		"Read files before editing",
+		"Do not perform destructive or irreversible actions",
 		"report what happened honestly",
-		"do not silently retry the same failing approach",
-		"Stay efficient: explore purposefully",
+		"silently retry the same failing approach",
+		"Security & System Integrity",
+		"Context Efficiency",
+		"Engineering Standards",
+		"Research → Strategy → Execution",
+		"Tool Usage & Parallelism",
 	}
 	for _, item := range required {
 		if !strings.Contains(prompt, item) {
@@ -154,6 +280,24 @@ func assertPromptPhases(t *testing.T, got, want []PromptPhase) {
 			t.Fatalf("unexpected phase order: got=%v want=%v", got, want)
 		}
 	}
+}
+
+func containsActivityKind(items []ActivityEvent, kind string) bool {
+	for _, item := range items {
+		if item.Kind == kind {
+			return true
+		}
+	}
+	return false
+}
+
+func firstActivityEntryID(items []ActivityEvent, kind string) string {
+	for _, item := range items {
+		if item.Kind == kind && strings.TrimSpace(item.EntryID) != "" {
+			return item.EntryID
+		}
+	}
+	return ""
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"ascaris/internal/api"
+	"ascaris/internal/tasks"
 )
 
 type PermissionMode string
@@ -64,6 +65,9 @@ func LiveDefinitions(allowedTools []string) []api.ToolDefinition {
 		toolDefinition("glob_search", "Expand a glob pattern inside the current workspace", `{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"],"additionalProperties":false}`),
 		toolDefinition("grep_search", "Search file contents for a pattern", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"output_mode":{"type":"string"}},"required":["pattern","path"],"additionalProperties":false}`),
 		toolDefinition("bash", "Execute a shell command", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"],"additionalProperties":false}`),
+		toolDefinition("task_create", "Create a task in the workspace task list", `{"type":"object","properties":{"title":{"type":"string"},"blocked_by":{"type":"array","items":{"type":"integer"}}},"required":["title"],"additionalProperties":false}`),
+		toolDefinition("task_update", "Update the status of a task (open, in_progress, done, cancelled)", `{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"string"}},"required":["id","status"],"additionalProperties":false}`),
+		toolDefinition("task_list", "List all tasks in the workspace task list", `{"type":"object","properties":{},"additionalProperties":false}`),
 	}
 	definitions = append(definitions, controlPlaneDefinitions()...)
 	if len(allowed) == 0 {
@@ -102,6 +106,12 @@ func ExecuteLive(ctx LiveContext, call LiveCall) LiveResult {
 		return executeGrepSearch(ctx, call)
 	case "bash":
 		return executeBash(ctx, call)
+	case "task_create":
+		return executeTaskCreate(ctx, call)
+	case "task_update":
+		return executeTaskUpdate(ctx, call)
+	case "task_list":
+		return executeTaskList(ctx, call)
 	default:
 		if result, ok := executeControlPlaneTool(ctx, call); ok {
 			return result
@@ -386,6 +396,76 @@ func executeGrepSearch(ctx LiveContext, call LiveCall) LiveResult {
 	return liveJSON(call, result)
 }
 
+var bashCriticalPatterns = []string{"rm -rf /", "dd if=", ":(){:|:&};:", "mkfs", "shutdown", "reboot"}
+var bashHighPatterns = []string{"rm -rf", "git push -f", "git push --force", "reset --hard", "drop table", "drop database", "git branch -d"}
+var bashMediumPatterns = []string{"rm ", "mv ", "git push", "chmod ", "chown ", "sudo "}
+
+// bashCommandTitle returns a short, scannable label for a shell command.
+// It identifies the primary executable and formats the first meaningful
+// argument in parentheses, e.g. "git(diff --stat)", "go(test ./...)",
+// truncating to keep the label under ~32 chars.
+func bashCommandTitle(cmd string) string {
+	cmd = strings.TrimSpace(cmd)
+	if cmd == "" {
+		return "bash"
+	}
+	// Take only the first line so multi-line scripts get a clean label.
+	firstLine := strings.SplitN(cmd, "\n", 2)[0]
+	fields := strings.Fields(firstLine)
+	if len(fields) == 0 {
+		return "bash"
+	}
+	// Executable: strip any leading path (e.g. /usr/bin/git → git).
+	exe := filepath.Base(fields[0])
+	if len(fields) == 1 {
+		return exe
+	}
+	// Collect args up to ~24 chars to fit the label budget.
+	args := strings.Join(fields[1:], " ")
+	const maxArgs = 24
+	if len(args) > maxArgs {
+		args = args[:maxArgs] + "…"
+	}
+	return fmt.Sprintf("%s(%s)", exe, args)
+}
+
+// bashOutputPreview returns the first few lines of stderr (preferred) or
+// stdout for surfacing in the activity panel on failure.
+func bashOutputPreview(stdoutStr, stderrStr string) string {
+	src := strings.TrimSpace(stderrStr)
+	if src == "" {
+		src = strings.TrimSpace(stdoutStr)
+	}
+	if src == "" {
+		return ""
+	}
+	lines := strings.SplitN(src, "\n", 4)
+	if len(lines) > 3 {
+		lines = append(lines[:3], "…")
+	}
+	return strings.Join(lines, "\n")
+}
+
+func bashRiskLevel(cmd string) string {
+	lower := strings.ToLower(cmd)
+	for _, p := range bashCriticalPatterns {
+		if strings.Contains(lower, p) {
+			return "CRITICAL"
+		}
+	}
+	for _, p := range bashHighPatterns {
+		if strings.Contains(lower, p) {
+			return "HIGH"
+		}
+	}
+	for _, p := range bashMediumPatterns {
+		if strings.Contains(lower, p) {
+			return "MEDIUM"
+		}
+	}
+	return "LOW"
+}
+
 func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 	if ctx.PermissionMode == PermissionReadOnly {
 		return liveError(call, "bash requires workspace-write permission")
@@ -397,13 +477,15 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 	if err := json.Unmarshal(call.Input, &input); err != nil {
 		return liveError(call, "invalid bash input: "+err.Error())
 	}
+	title := bashCommandTitle(input.Command)
 	if ctx.PermissionMode == PermissionWorkspaceWrite {
 		if ctx.Prompter == nil {
 			return liveError(call, "bash requires an approval prompter in workspace-write mode")
 		}
+		risk := bashRiskLevel(input.Command)
 		emitToolActivity(ctx, LiveToolEvent{
 			Kind:    "approval",
-			Title:   "bash",
+			Title:   fmt.Sprintf("%s [risk: %s]", title, risk),
 			Summary: "Awaiting approval for shell command.",
 			Detail:  input.Command,
 		})
@@ -417,7 +499,7 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 	}
 	emitToolActivity(ctx, LiveToolEvent{
 		Kind:    "bash_start",
-		Title:   "bash",
+		Title:   title,
 		Summary: "Running shell command.",
 		Detail:  input.Command,
 	})
@@ -441,12 +523,17 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 		"stderr":    stderr.String(),
 		"exit_code": exitCode,
 	}
+	data, _ := json.Marshal(output)
 	if exitCode != 0 {
-		data, _ := json.Marshal(output)
+		preview := bashOutputPreview(stdout.String(), stderr.String())
+		summary := fmt.Sprintf("Exited %d.", exitCode)
+		if preview != "" {
+			summary = fmt.Sprintf("Exited %d: %s", exitCode, preview)
+		}
 		emitToolActivity(ctx, LiveToolEvent{
 			Kind:    "bash_result",
-			Title:   "bash",
-			Summary: fmt.Sprintf("Shell command exited with status %d.", exitCode),
+			Title:   title,
+			Summary: summary,
 			Detail:  string(data),
 			Error:   true,
 		})
@@ -457,10 +544,9 @@ func executeBash(ctx LiveContext, call LiveCall) LiveResult {
 			IsError:   true,
 		}
 	}
-	data, _ := json.Marshal(output)
 	emitToolActivity(ctx, LiveToolEvent{
 		Kind:    "bash_result",
-		Title:   "bash",
+		Title:   title,
 		Summary: "Shell command completed successfully.",
 		Detail:  string(data),
 	})
@@ -520,4 +606,58 @@ func emitToolActivity(ctx LiveContext, event LiveToolEvent) {
 		return
 	}
 	ctx.Activity(event)
+}
+
+func executeTaskCreate(ctx LiveContext, call LiveCall) LiveResult {
+	var input struct {
+		Title     string `json:"title"`
+		BlockedBy []int  `json:"blocked_by"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid task_create input: "+err.Error())
+	}
+	if strings.TrimSpace(input.Title) == "" {
+		return liveError(call, "task title is required")
+	}
+	t, err := tasks.Create(ctx.Root, strings.TrimSpace(input.Title), input.BlockedBy)
+	if err != nil {
+		return liveError(call, "task_create: "+err.Error())
+	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "task",
+		Title:   fmt.Sprintf("task #%d created", t.ID),
+		Summary: t.Title,
+	})
+	result := map[string]any{"id": t.ID, "title": t.Title, "status": t.Status}
+	return liveJSON(call, result)
+}
+
+func executeTaskUpdate(ctx LiveContext, call LiveCall) LiveResult {
+	var input struct {
+		ID     int    `json:"id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid task_update input: "+err.Error())
+	}
+	t, err := tasks.Update(ctx.Root, input.ID, input.Status)
+	if err != nil {
+		return liveError(call, "task_update: "+err.Error())
+	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "task",
+		Title:   fmt.Sprintf("task #%d → %s", t.ID, t.Status),
+		Summary: t.Title,
+	})
+	result := map[string]any{"id": t.ID, "title": t.Title, "status": t.Status}
+	return liveJSON(call, result)
+}
+
+func executeTaskList(ctx LiveContext, call LiveCall) LiveResult {
+	tl, err := tasks.Load(ctx.Root)
+	if err != nil {
+		return liveError(call, "task_list: "+err.Error())
+	}
+	data, _ := json.Marshal(tl.Tasks)
+	return LiveResult{ToolUseID: call.ID, Name: call.Name, Output: string(data)}
 }

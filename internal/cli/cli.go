@@ -47,6 +47,7 @@ import (
 	"ascaris/internal/systeminit"
 	"ascaris/internal/tools"
 	"ascaris/internal/version"
+	"ascaris/internal/workspace"
 )
 
 type Context struct {
@@ -815,6 +816,59 @@ func resultEntryID(turnID string, iteration int) string {
 	return fmt.Sprintf("%s-iter-%d-result", turnID, iteration)
 }
 
+func runMemorySlashResult(ctx Context, args []string) repl.SlashResult {
+	subcommand := ""
+	if len(args) > 0 {
+		subcommand = strings.ToLower(strings.TrimSpace(args[0]))
+	}
+	switch subcommand {
+	case "clear":
+		if err := workspace.ClearMemory(ctx.Root); err != nil {
+			return repl.SlashResult{Output: "Failed to clear memory: " + err.Error(), Error: true}
+		}
+		return repl.SlashResult{Output: "Workspace memory cleared."}
+	case "add":
+		note := strings.TrimSpace(strings.Join(args[1:], " "))
+		if note == "" {
+			return repl.SlashResult{Output: "Usage: /memory add <note text>"}
+		}
+		if err := workspace.AppendMemory(ctx.Root, note); err != nil {
+			return repl.SlashResult{Output: "Failed to save note: " + err.Error(), Error: true}
+		}
+		return repl.SlashResult{Output: fmt.Sprintf("Saved to workspace memory: %s", note)}
+	default:
+		mem := workspace.ReadMemory(ctx.Root)
+		if mem == "" {
+			return repl.SlashResult{Output: "Workspace memory is empty.\nAdd notes with: /memory add <note>"}
+		}
+		return repl.SlashResult{Output: "## Workspace Memory\n\n" + mem}
+	}
+}
+
+func runCommitSlashResult(ctx Context) repl.SlashResult {
+	diffCmd := exec.Command("git", "diff", "--staged")
+	diffCmd.Dir = ctx.Root
+	diffOut, err := diffCmd.Output()
+	if err != nil {
+		return repl.SlashResult{Output: "git diff --staged failed: " + err.Error(), Error: true}
+	}
+	if strings.TrimSpace(string(diffOut)) == "" {
+		return repl.SlashResult{Output: "Nothing staged. Use `git add <file>` first, then /commit."}
+	}
+	statusCmd := exec.Command("git", "status", "--short")
+	statusCmd.Dir = ctx.Root
+	statusOut, _ := statusCmd.Output()
+	prompt := "You are a senior engineer. Given the following staged git diff, write a single " +
+		"conventional commit message (format: `type: subject` where subject is ≤72 chars, lowercase, no period). " +
+		"Then immediately run the commit using bash: git commit -m \"<your message>\". " +
+		"Do not ask for confirmation — just write the message and commit.\n\n" +
+		"Git status:\n" + string(statusOut) + "\nGit diff --staged:\n" + string(diffOut)
+	return repl.SlashResult{
+		Output:    "Generating commit message from staged changes…",
+		RunPrompt: prompt,
+	}
+}
+
 func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashResult {
 	args, err := splitInteractiveCommand(line)
 	if err != nil {
@@ -865,6 +919,35 @@ func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashRe
 				Output:         fmt.Sprintf("Provider set to %s for this session.", newProvider),
 				UpdateProvider: effectiveProvider,
 			}
+		case "/plan":
+			task := strings.TrimSpace(strings.Join(args[1:], " "))
+			taskDesc := task
+			if taskDesc == "" {
+				taskDesc = "the task described in this conversation"
+			}
+			prompt := "You are planning work for this workspace. Follow these steps exactly:\n\n" +
+				"## Step 1 — Read the workspace\n" +
+				"Run these bash commands to understand the current state:\n" +
+				"  git ls-files | head -60\n" +
+				"  git status --short\n\n" +
+				"## Step 2 — Create tasks\n" +
+				"Use the task_create tool to break down this task into concrete, numbered subtasks:\n\n  " + taskDesc + "\n\n" +
+				"Rules for task creation:\n" +
+				"- Each task must be a single, actionable unit of work\n" +
+				"- Set blocked_by to the IDs of tasks that must complete first\n" +
+				"- Keep titles under 72 chars\n" +
+				"- Do NOT start implementing yet\n\n" +
+				"## Step 3 — Ask for approval\n" +
+				"After creating all tasks, output a short summary of the plan and ask:\n" +
+				"\"Shall I begin with task #1, or would you like to adjust the plan?\""
+			return repl.SlashResult{
+				Output:    "Reading workspace and building task list…",
+				RunPrompt: prompt,
+			}
+		case "/memory":
+			return runMemorySlashResult(ctx, args[1:])
+		case "/commit":
+			return runCommitSlashResult(ctx)
 		}
 	}
 	var stdout bytes.Buffer
@@ -1908,7 +1991,7 @@ func runSlashCommand(ctx Context, options globalOptions, args []string, stdout, 
 	if strings.HasPrefix(command, "/oh-my-claudecode:") {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nCompatibility note: `%s` uses a legacy Claude Code/OMC plugin prefix. Import supported legacy assets with `ascaris migrate legacy`, then use the native `ascaris` command and plugin surface.", command, command))
 	}
-	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/model", "/provider", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state"})
+	suggestion := closestSlashCommand(command, []string{"/review", "/security-review", "/bughunter", "/fuzz", "/crash-triage", "/model", "/provider", "/help", "/status", "/sandbox", "/config", "/session", "/resume", "/compact", "/clear", "/export", "/cost", "/version", "/login", "/logout", "/agents", "/skills", "/team", "/cron", "/worker", "/plugin", "/mcp", "/state", "/plan", "/memory", "/commit", "/summary"})
 	if suggestion != "" {
 		return fail(stderr, fmt.Errorf("unknown slash command outside the REPL: %s\nDid you mean %s?", command, suggestion))
 	}

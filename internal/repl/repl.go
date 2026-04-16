@@ -14,11 +14,14 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+
+	"ascaris/internal/tasks"
 )
 
 const (
-	minWidth  = 60
-	minHeight = 16
+	minWidth      = 60
+	minHeight     = 16
+	maxInputLines = 6
 )
 
 type Status struct {
@@ -127,6 +130,7 @@ const (
 )
 
 type spinnerTick time.Time
+type taskPollTick time.Time
 
 // slashItem is a single autocomplete entry for the command picker.
 type slashItem struct {
@@ -176,6 +180,9 @@ var slashRegistry = []slashItem{
 	{"/model", "Switch model for this session"},
 	{"/provider", "Switch provider for this session"},
 	{"/summary", "Ask the model to summarize this session"},
+	{"/plan", "Ask the model to produce a numbered implementation plan"},
+	{"/memory", "View, add, or clear persistent workspace memory notes"},
+	{"/commit", "Generate a conventional commit message from staged changes and commit"},
 }
 
 // verbForActivityKind maps an activity event kind to a human-readable spinner verb.
@@ -249,6 +256,11 @@ type model struct {
 
 	comp        completion
 	pasteBlocks []string // full content of each paste block; index+1 = block number
+
+	taskList    []tasks.Task
+	showTasks   bool
+	lastTaskMod time.Time
+	taskRoot    string
 
 	theme Theme
 	md    *markdownRenderer
@@ -335,6 +347,7 @@ func newModel(ctx context.Context, cancel context.CancelFunc, cfg Config) model 
 		eventCh:      make(chan tea.Msg, 64),
 		theme:        DefaultTheme(),
 		md:           newMarkdownRenderer(80),
+		taskRoot:     strings.TrimSpace(status.Workspace),
 	}
 	m.refreshTranscript()
 	m.refreshActivity()
@@ -378,7 +391,13 @@ func applyTextareaTheme(input *textarea.Model) {
 func (m model) Init() tea.Cmd {
 	// Enable bracketed paste so we can detect pasted content and show a compact
 	// placeholder instead of dumping raw text into the input line.
-	return tea.Batch(textarea.Blink, tea.EnableBracketedPaste)
+	return tea.Batch(textarea.Blink, tea.EnableBracketedPaste, taskPollCmd())
+}
+
+func taskPollCmd() tea.Cmd {
+	return tea.Tick(2*time.Second, func(t time.Time) tea.Msg {
+		return taskPollTick(t)
+	})
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -390,6 +409,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.refreshTranscript()
 		m.refreshActivity()
 		return m, nil
+	case taskPollTick:
+		mod := tasks.ModTime(m.taskRoot)
+		if !mod.IsZero() && mod != m.lastTaskMod {
+			m.lastTaskMod = mod
+			if tl, err := tasks.Load(m.taskRoot); err == nil {
+				m.taskList = tl.Tasks
+			}
+		}
+		return m, taskPollCmd()
 	case spinnerTick:
 		if !m.busy {
 			// Turn ended while tick was in flight; don't reschedule.
@@ -517,6 +545,21 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.refreshTranscript()
 		m.refreshActivity()
 		return m, nil
+	case "ctrl+t":
+		if tl, err := tasks.Load(m.taskRoot); err == nil {
+			m.taskList = tl.Tasks
+			m.lastTaskMod = tasks.ModTime(m.taskRoot)
+		}
+		m.showTasks = !m.showTasks
+		if !m.showTasks {
+			m.showActivity = true
+		} else {
+			m.showActivity = false
+		}
+		m.layout()
+		m.refreshTranscript()
+		m.refreshActivity()
+		return m, nil
 	}
 
 	// When the autocomplete overlay is open, intercept navigation keys before
@@ -540,6 +583,9 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.input.SetValue(selected.name + " ")
 			m.input.CursorEnd()
 			m.comp.active = false
+			m.layout()
+			m.refreshTranscript()
+			m.refreshActivity()
 			return m, nil
 		case "esc":
 			m.comp.active = false
@@ -633,6 +679,9 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "ctrl+j", "alt+enter":
 		m.input.InsertString("\n")
+		m.layout()
+		m.refreshTranscript()
+		m.refreshActivity()
 		return m, nil
 	case "enter":
 		return m.submitInput()
@@ -642,15 +691,19 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	m.input, cmd = m.input.Update(msg)
 	// Update completion state whenever input changes.
 	m.updateCompletion()
+	// Reflow layout so the composer grows/shrinks with the typed content.
+	m.layout()
+	m.refreshTranscript()
+	m.refreshActivity()
 	return m, cmd
 }
 
-// expandPastePlaceholders replaces [Pasted text #N +M lines] tokens in s with
+// expandPastePlaceholders replaces [Pasted text #N …] tokens in s with
 // the stored full content from m.pasteBlocks.
 func (m model) expandPastePlaceholders(s string) string {
 	for i, content := range m.pasteBlocks {
 		extra := strings.Count(content, "\n")
-		placeholder := pasteBlockPlaceholder(i+1, extra)
+		placeholder := pasteBlockPlaceholder(i+1, extra, len([]rune(content)))
 		s = strings.ReplaceAll(s, placeholder, content)
 	}
 	return s
@@ -678,14 +731,18 @@ func (m model) handlePaste(text string) (tea.Model, tea.Cmd) {
 	m.pasteBlocks = append(m.pasteBlocks, text)
 	n := len(m.pasteBlocks)
 	extra := lineCount - 1
-	placeholder := fmt.Sprintf("[Pasted text #%d +%d lines]", n, extra)
+	placeholder := pasteBlockPlaceholder(n, extra, len([]rune(text)))
 	m.input.InsertString(placeholder)
 	m.updateCompletion()
 	return m, nil
 }
 
 // pasteBlockPlaceholder returns the placeholder string for paste block n (1-indexed).
-func pasteBlockPlaceholder(n, extraLines int) string {
+// Single-line pastes show char count; multi-line pastes show line count.
+func pasteBlockPlaceholder(n, extraLines, charCount int) string {
+	if extraLines == 0 {
+		return fmt.Sprintf("[Pasted text #%d · %d chars]", n, charCount)
+	}
 	return fmt.Sprintf("[Pasted text #%d +%d lines]", n, extraLines)
 }
 
@@ -708,6 +765,7 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.input.Reset()
+		m.layout() // shrink composer back to 1 line
 		result := m.cfg.HandleSlash(m.ctx, line)
 		if result.ResetState {
 			m.transcriptEntries = nil
@@ -781,6 +839,7 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 	// Expand paste placeholders back to their full content before submitting.
 	prompt := m.expandPastePlaceholders(rawPrompt)
 	m.input.Reset()
+	m.layout() // shrink composer back to 1 line after submit
 	m.pasteBlocks = nil // placeholders consumed; reset for next turn
 	m.startupNote = ""
 	m.appendTranscript("Run Request", prompt, "task")
@@ -811,13 +870,43 @@ func (m model) View() string {
 	main := m.renderMainContent()
 	completionOverlay := m.renderCompletion()
 	composer := m.panel(m.renderComposerInner(), m.width-2, 2, m.focus == focusInput)
-	footer := m.theme.Help().Render("Enter send • Up/Down scroll • / autocomplete • Ctrl+J newline • F2 activity • Tab focus • Ctrl+D exit")
+	footer := m.theme.Help().Render("Enter send • Up/Down scroll • / autocomplete • Ctrl+J newline • F2 activity • Ctrl+T tasks • Tab focus • Ctrl+D exit")
 	parts := []string{header, strip, main}
 	if completionOverlay != "" {
 		parts = append(parts, completionOverlay)
 	}
 	parts = append(parts, composer, footer)
 	return lipgloss.JoinVertical(lipgloss.Left, parts...)
+}
+
+// computeInputHeight returns the number of visual rows the current input value
+// occupies given the textarea's width, clamped to [1, maxInputLines].
+func (m *model) computeInputHeight() int {
+	value := m.input.Value()
+	if value == "" {
+		return 1
+	}
+	const promptCells = 2 // "› " occupies 2 terminal cells
+	textWidth := m.input.Width() - promptCells
+	if textWidth <= 0 {
+		return 1
+	}
+	total := 0
+	for _, line := range strings.Split(value, "\n") {
+		chars := len([]rune(line))
+		if chars == 0 {
+			total++
+		} else {
+			total += (chars + textWidth - 1) / textWidth
+		}
+	}
+	if total < 1 {
+		return 1
+	}
+	if total > maxInputLines {
+		return maxInputLines
+	}
+	return total
 }
 
 func (m *model) layout() {
@@ -831,11 +920,11 @@ func (m *model) layout() {
 		return
 	}
 	m.input.SetWidth(max(18, m.width-8))
-	m.input.SetHeight(1)
+	m.input.SetHeight(m.computeInputHeight())
 
 	headerHeight := 5
 	stripHeight := 1
-	composerHeight := 4 // 2 content lines (cwd + input) + 2 border
+	composerHeight := m.input.Height() + 3 // cwd line + input rows + 2 borders
 	footerHeight := 1
 	mainHeight := m.height - headerHeight - stripHeight - composerHeight - footerHeight - 4
 	if mainHeight < 8 {
@@ -1382,14 +1471,66 @@ func (m model) renderMainContent() string {
 		return m.renderStartupView()
 	}
 	transcriptPanel := m.panel(m.transcript.View(), m.transcript.Width+2, m.transcript.Height+2, m.focus == focusTranscript)
-	if !m.showActivity {
+	if !m.showActivity && !m.showTasks {
 		return transcriptPanel
 	}
-	activityPanel := m.panel(m.activity.View(), m.activity.Width+2, m.activity.Height+2, m.focus == focusActivity)
-	if m.width >= 120 {
-		return lipgloss.JoinHorizontal(lipgloss.Top, transcriptPanel, " ", activityPanel)
+	var rightPanel string
+	if m.showTasks {
+		rightPanel = m.panel(m.renderTaskPanel(), m.activity.Width+2, m.activity.Height+2, false)
+	} else {
+		rightPanel = m.panel(m.activity.View(), m.activity.Width+2, m.activity.Height+2, m.focus == focusActivity)
 	}
-	return lipgloss.JoinVertical(lipgloss.Left, transcriptPanel, activityPanel)
+	if m.width >= 120 {
+		return lipgloss.JoinHorizontal(lipgloss.Top, transcriptPanel, " ", rightPanel)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, transcriptPanel, rightPanel)
+}
+
+func (m model) renderTaskPanel() string {
+	tl := m.taskList
+	if len(tl) == 0 {
+		return m.theme.Help().Render("No tasks yet.\nUse /plan to create a task list.")
+	}
+	done := 0
+	for _, t := range tl {
+		if t.Status == tasks.StatusDone || t.Status == tasks.StatusCancelled {
+			done++
+		}
+	}
+	open := len(tl) - done
+	header := m.theme.Accent().Render(fmt.Sprintf("Tasks (%d done, %d open) · ctrl+t to hide", done, open))
+	lines := []string{header, ""}
+	panelWidth := m.activity.Width
+	for _, t := range tl {
+		blocked := tasks.IsBlocked(t, tl)
+		var icon, titleText string
+		switch {
+		case t.Status == tasks.StatusDone || t.Status == tasks.StatusCancelled:
+			icon = m.theme.Success().Render("✓")
+			titleText = m.theme.Help().Strikethrough(true).Render(fmt.Sprintf("#%d %s", t.ID, t.Title))
+		case t.Status == tasks.StatusInProgress:
+			icon = m.theme.Accent().Render("▶")
+			titleText = m.theme.Accent().Bold(true).Render(fmt.Sprintf("#%d %s", t.ID, t.Title))
+		default:
+			icon = m.theme.Help().Render("□")
+			titleText = m.theme.Body().Render(fmt.Sprintf("#%d %s", t.ID, t.Title))
+		}
+		line := icon + " " + titleText
+		if blocked {
+			deps := make([]string, len(t.BlockedBy))
+			for i, d := range t.BlockedBy {
+				deps[i] = fmt.Sprintf("#%d", d)
+			}
+			line += m.theme.Help().Render(" › blocked by " + strings.Join(deps, ", "))
+		}
+		// Soft-wrap long lines to panel width.
+		runes := []rune(line)
+		if panelWidth > 4 && len(runes) > panelWidth {
+			line = string(runes[:panelWidth-1]) + "…"
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
 }
 
 func (m model) renderWelcome() string {
