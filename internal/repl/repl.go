@@ -534,7 +534,7 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.recordActivity(activityRecord{title: "Approval", summary: label, kind: "approval", err: true})
 			m.approval = nil
 			m.statusText = "Working"
-			if m.approval == nil && msg.String() != "esc" {
+			if msg.String() != "esc" {
 				m.focus = focusInput
 			}
 			return m, waitForRuntimeEvent(m.eventCh)
@@ -1794,7 +1794,16 @@ func (m model) renderApprovalScreen() string {
 }
 
 func (m model) renderPlanApprovalScreen(width int) string {
+	// Prefer the live task JSON embedded in the approval request — it was written
+	// immediately before the approval prompt, so it's always up to date even if
+	// the 2s poll hasn't fired yet.
 	tl := m.taskList
+	if m.approval != nil && strings.TrimSpace(m.approval.Input) != "" {
+		var parsed []tasks.Task
+		if err := json.Unmarshal([]byte(m.approval.Input), &parsed); err == nil && len(parsed) > 0 {
+			tl = parsed
+		}
+	}
 	done, open := 0, 0
 	for _, t := range tl {
 		if t.Status == "done" || t.Status == "cancelled" {
@@ -1804,7 +1813,7 @@ func (m model) renderPlanApprovalScreen(width int) string {
 		}
 	}
 	header := m.theme.Primary().Render("Plan Ready")
-	subheader := m.theme.Meta().Render(fmt.Sprintf("%d tasks to implement", open))
+	subheader := m.theme.Meta().Render(fmt.Sprintf("%d tasks to implement · %d done", open, done))
 	var taskLines []string
 	for _, t := range tl {
 		var icon, text string
