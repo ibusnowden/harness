@@ -550,6 +550,11 @@ func defaultSystemPrompt() string {
 		"If a command or tool fails, report what happened honestly. Diagnose the cause from the evidence, avoid pretending success, and do not silently retry the same failing approach or modify tests and checks just to force a pass.",
 		"Adapt when needed, but only by trying a materially different evidence-based approach that still respects the user's instructions and constraints.",
 		"Stay efficient: explore purposefully, avoid unnecessary research, and keep answers direct.",
+		"The bash tool can run any shell command available on the host, including git. " +
+			"Use bash to execute git operations (git status, git diff, git add, git commit, git push, git log, etc.) whenever the user requests them. " +
+			"Git credentials, SSH keys, and credential helpers configured on the host machine are automatically available to bash — do not refuse git operations on the grounds of missing credentials. " +
+			"Attempt the command and report the actual output, success or failure. " +
+			"For potentially destructive git operations (force push, branch deletion, reset --hard), confirm with the user before running.",
 	}, "\n\n")
 }
 

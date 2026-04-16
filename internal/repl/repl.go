@@ -913,7 +913,7 @@ func (m *model) handleActivityEvent(msg ActivityEvent) {
 	// For file_edit events, render a proper unified diff inline in the transcript.
 	// The Detail already contains a fileDiff JSON payload from builtins.go.
 	if msg.Kind == "file_edit" {
-		if diff := renderInlineDiff(msg.Detail, m.theme); diff != "" {
+		if diff := renderInlineDiff(msg.Detail, m.theme, m.transcript.Width); diff != "" {
 			// Keep summary as-is (already set by builtins.go: "Editing <path>").
 			// Replace Detail with the rendered diff so timelineEntryForActivity
 			// can include it directly.
@@ -1807,7 +1807,8 @@ type fileDiff struct {
 // renderInlineDiff parses a file_edit Detail JSON (produced by builtins.go) and
 // returns a unified-diff style string ready for display in the transcript.
 // Returns "" if the detail is not a valid fileDiff payload.
-func renderInlineDiff(detail string, theme Theme) string {
+// width controls the full-line highlight width (pass m.transcript.Width).
+func renderInlineDiff(detail string, theme Theme, width int) string {
 	detail = strings.TrimSpace(detail)
 	if detail == "" || detail[0] != '{' {
 		return ""
@@ -1820,37 +1821,54 @@ func renderInlineDiff(detail string, theme Theme) string {
 		return ""
 	}
 
-	// Styles
-	hunkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("74")).Bold(true) // steel blue
-	ctxStyle := theme.Help()                                                      // dim brown-tan
-	removeStyle := theme.Err()                                                    // red
-	addStyle := theme.Success()                                                   // olive
+	lineWidth := max(40, width-4)
+
+	// Hunk header: steel-blue, no background.
+	hunkStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("74")).Bold(true)
+
+	// Context lines: dim, no background.
+	ctxStyle := theme.Help()
+
+	// Removed lines: dark red background + bright red prefix, full-width.
+	removeBg := lipgloss.NewStyle().
+		Background(lipgloss.Color("52")).  // dark red
+		Foreground(lipgloss.Color("203")). // bright red text
+		Width(lineWidth)
+	removePfx := lipgloss.NewStyle().
+		Background(lipgloss.Color("52")).
+		Foreground(lipgloss.Color("203")).
+		Bold(true)
+
+	// Added lines: dark green background + bright green prefix, full-width.
+	addBg := lipgloss.NewStyle().
+		Background(lipgloss.Color("22")).  // dark green
+		Foreground(lipgloss.Color("114")). // bright green text
+		Width(lineWidth)
+	addPfx := lipgloss.NewStyle().
+		Background(lipgloss.Color("22")).
+		Foreground(lipgloss.Color("114")).
+		Bold(true)
+
+	renderLine := func(bgStyle, pfxStyle lipgloss.Style, prefix, content string) string {
+		return bgStyle.Render(pfxStyle.Render(prefix) + content)
+	}
 
 	var lines []string
 
-	// Hunk header: @@ -12,4 +12,6 @@
 	if d.HunkHeader != "" {
 		lines = append(lines, hunkStyle.Render(d.HunkHeader))
 	}
-
-	// Context before
 	for _, l := range d.Before {
-		lines = append(lines, ctxStyle.Render(" "+l))
+		lines = append(lines, ctxStyle.Render("  "+l))
 	}
-
-	// Removed lines (red −)
 	for _, l := range d.Removed {
-		lines = append(lines, removeStyle.Render("-"+l))
+		lines = append(lines, renderLine(removeBg, removePfx, "- ", l))
 	}
-
-	// Added lines (olive +)
 	for _, l := range d.Added {
-		lines = append(lines, addStyle.Render("+"+l))
+		lines = append(lines, renderLine(addBg, addPfx, "+ ", l))
 	}
-
-	// Context after
 	for _, l := range d.After {
-		lines = append(lines, ctxStyle.Render(" "+l))
+		lines = append(lines, ctxStyle.Render("  "+l))
 	}
 
 	return strings.Join(lines, "\n")
