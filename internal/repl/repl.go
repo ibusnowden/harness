@@ -62,6 +62,7 @@ type ActivityEvent struct {
 type ApprovalRequest struct {
 	ToolName string
 	Input    string
+	Kind     string // "bash" (default) or "plan"
 	Response chan bool
 }
 
@@ -181,7 +182,6 @@ var slashRegistry = []slashItem{
 	{"/provider", "Switch provider for this session"},
 	{"/summary", "Ask the model to summarize this session"},
 	{"/plan", "Ask the model to produce a numbered implementation plan"},
-	{"/proceed", "Approve the plan and begin executing all tasks"},
 	{"/memory", "View, add, or clear persistent workspace memory notes"},
 	{"/commit", "Generate a conventional commit message from staged changes and commit"},
 }
@@ -514,15 +514,29 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "y", "Y":
 			m.approval.Response <- true
-			m.recordActivity(activityRecord{title: "Approval", summary: "Approved by user.", kind: "approval"})
+			label := "Approved by user."
+			if m.approval.Kind == "plan" {
+				label = "Plan approved. Executing…"
+				m.showTasks = true
+				m.showActivity = false
+			}
+			m.recordActivity(activityRecord{title: "Approval", summary: label, kind: "approval"})
 			m.approval = nil
 			m.statusText = "Working"
+			m.layout()
 			return m, waitForRuntimeEvent(m.eventCh)
 		case "n", "N", "esc":
 			m.approval.Response <- false
-			m.recordActivity(activityRecord{title: "Approval", summary: "Denied by user.", kind: "approval", err: true})
+			label := "Denied by user."
+			if m.approval.Kind == "plan" {
+				label = "Plan adjustment requested."
+			}
+			m.recordActivity(activityRecord{title: "Approval", summary: label, kind: "approval", err: true})
 			m.approval = nil
 			m.statusText = "Working"
+			if m.approval == nil && msg.String() != "esc" {
+				m.focus = focusInput
+			}
 			return m, waitForRuntimeEvent(m.eventCh)
 		default:
 			return m, nil
@@ -864,8 +878,14 @@ func (m model) View() string {
 	strip := m.renderActivityStrip()
 	if m.approval != nil {
 		main := m.panel(m.renderApprovalScreen(), m.width-2, max(10, m.height-10), false)
-		composer := m.panel(m.theme.Help().Render("Approval pending. Choose approve once or deny to continue."), m.width-2, 1, false)
-		footer := m.theme.Help().Render("Y approve once • N deny • Esc deny")
+		var composer, footer string
+		if m.approval.Kind == "plan" {
+			composer = m.panel(m.theme.Help().Render("Review the plan above and choose an action."), m.width-2, 1, false)
+			footer = m.theme.Help().Render("Y execute plan • N adjust / give feedback • Esc cancel")
+		} else {
+			composer = m.panel(m.theme.Help().Render("Approval pending. Choose approve once or deny to continue."), m.width-2, 1, false)
+			footer = m.theme.Help().Render("Y approve once • N deny • Esc deny")
+		}
 		return lipgloss.JoinVertical(lipgloss.Left, header, strip, main, composer, footer)
 	}
 	main := m.renderMainContent()
@@ -1749,6 +1769,9 @@ func (m model) renderApprovalScreen() string {
 		return ""
 	}
 	width := max(42, min(96, m.width-12))
+	if m.approval.Kind == "plan" {
+		return m.renderPlanApprovalScreen(width)
+	}
 	commandPreview := m.formatApprovalInput(max(24, width-10))
 	riskLabel, riskStyle := approvalRiskLabel(m.approval.ToolName, m.theme)
 	approveChip := m.theme.Success().Render("[Y] Approve once")
@@ -1765,6 +1788,49 @@ func (m model) renderApprovalScreen() string {
 		m.theme.Help().Render("Approve once runs this action for the current request only. Deny keeps the harness in the current turn and returns an error to the tool call."),
 		m.theme.Help().Render("Keys: y approve once • n deny • esc deny"),
 	}
+	return lipgloss.Place(m.width-4, max(10, m.height-12), lipgloss.Center, lipgloss.Center,
+		m.theme.Modal().Width(width).Render(strings.Join(body, "\n")),
+	)
+}
+
+func (m model) renderPlanApprovalScreen(width int) string {
+	tl := m.taskList
+	done, open := 0, 0
+	for _, t := range tl {
+		if t.Status == "done" || t.Status == "cancelled" {
+			done++
+		} else {
+			open++
+		}
+	}
+	header := m.theme.Primary().Render("Plan Ready")
+	subheader := m.theme.Meta().Render(fmt.Sprintf("%d tasks to implement", open))
+	var taskLines []string
+	for _, t := range tl {
+		var icon, text string
+		switch t.Status {
+		case "done", "cancelled":
+			icon = m.theme.Success().Render("✓")
+			text = m.theme.Help().Strikethrough(true).Render(fmt.Sprintf("#%d %s", t.ID, t.Title))
+		default:
+			icon = m.theme.Help().Render("□")
+			if tasks.IsBlocked(t, tl) {
+				deps := make([]string, len(t.BlockedBy))
+				for i, d := range t.BlockedBy {
+					deps[i] = fmt.Sprintf("#%d", d)
+				}
+				text = m.theme.Help().Render(fmt.Sprintf("#%d %s  › blocked by %s", t.ID, t.Title, strings.Join(deps, ", ")))
+			} else {
+				text = m.theme.Body().Render(fmt.Sprintf("#%d %s", t.ID, t.Title))
+			}
+		}
+		taskLines = append(taskLines, icon+" "+text)
+	}
+	taskBox := m.panel(strings.Join(taskLines, "\n"), width-4, min(len(tl)+2, 12), false)
+	approveChip := m.theme.Success().Bold(true).Render("[Y] Execute plan")
+	denyChip := m.theme.Err().Render("[N] Adjust / give feedback")
+	hint := m.theme.Help().Render("Y begins implementation immediately · N lets you type feedback · Esc cancels")
+	body := []string{header, subheader, "", taskBox, "", lipgloss.JoinHorizontal(lipgloss.Left, approveChip, "   ", denyChip), "", hint}
 	return lipgloss.Place(m.width-4, max(10, m.height-12), lipgloss.Center, lipgloss.Center,
 		m.theme.Modal().Width(width).Render(strings.Join(body, "\n")),
 	)

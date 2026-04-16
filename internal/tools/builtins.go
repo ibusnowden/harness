@@ -68,6 +68,7 @@ func LiveDefinitions(allowedTools []string) []api.ToolDefinition {
 		toolDefinition("task_create", "Create a task in the workspace task list", `{"type":"object","properties":{"title":{"type":"string"},"blocked_by":{"type":"array","items":{"type":"integer"}}},"required":["title"],"additionalProperties":false}`),
 		toolDefinition("task_update", "Update the status of a task (open, in_progress, done, cancelled)", `{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"string"}},"required":["id","status"],"additionalProperties":false}`),
 		toolDefinition("task_list", "List all tasks in the workspace task list", `{"type":"object","properties":{},"additionalProperties":false}`),
+		toolDefinition("request_plan_approval", "Show the task list to the user and request approval before implementing. Call this after creating all tasks.", `{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`),
 	}
 	definitions = append(definitions, controlPlaneDefinitions()...)
 	if len(allowed) == 0 {
@@ -112,6 +113,8 @@ func ExecuteLive(ctx LiveContext, call LiveCall) LiveResult {
 		return executeTaskUpdate(ctx, call)
 	case "task_list":
 		return executeTaskList(ctx, call)
+	case "request_plan_approval":
+		return executeRequestPlanApproval(ctx, call)
 	default:
 		if result, ok := executeControlPlaneTool(ctx, call); ok {
 			return result
@@ -660,4 +663,41 @@ func executeTaskList(ctx LiveContext, call LiveCall) LiveResult {
 	}
 	data, _ := json.Marshal(tl.Tasks)
 	return LiveResult{ToolUseID: call.ID, Name: call.Name, Output: string(data)}
+}
+
+func executeRequestPlanApproval(ctx LiveContext, call LiveCall) LiveResult {
+	var input struct {
+		Summary string `json:"summary"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid request_plan_approval input: "+err.Error())
+	}
+	if ctx.Prompter == nil {
+		return liveError(call, "request_plan_approval requires an approval prompter")
+	}
+	// Pass the task list as JSON so the TUI can render it properly.
+	tl, _ := tasks.Load(ctx.Root)
+	taskData, _ := json.Marshal(tl.Tasks)
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "approval",
+		Title:   "plan_approval",
+		Summary: "Awaiting plan approval.",
+		Detail:  string(taskData),
+	})
+	approved, err := ctx.Prompter.Approve("plan_approval", string(taskData))
+	if err != nil {
+		return liveError(call, err.Error())
+	}
+	if !approved {
+		return LiveResult{
+			ToolUseID: call.ID,
+			Name:      call.Name,
+			Output:    `{"approved":false,"message":"User wants to adjust the plan. Ask what they would like to change."}`,
+		}
+	}
+	return LiveResult{
+		ToolUseID: call.ID,
+		Name:      call.Name,
+		Output:    `{"approved":true,"message":"Plan approved. Begin executing all tasks now following the Agentic Task Execution protocol. Start with task #1."}`,
+	}
 }
