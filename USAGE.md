@@ -76,4 +76,4 @@ GOCACHE="$(pwd)/.cache/go-build" go test ./...
 
 For a physical prompt-first terminal validation pass, use [`docs/prompt-e2e-stress-test.md`](./docs/prompt-e2e-stress-test.md).
 
-For local GLM + vLLM serving and harness bring-up, use [`docs/glm-cluster-deployment.md`](./docs/glm-cluster-deployment.md) and `scripts/smoke_glm_ascaris.sh`.
+For local vLLM serving and harness bring-up, use [`docs/qwen-vllm-smoke-test.md`](./docs/qwen-vllm-smoke-test.md). The same `inference/serve.sh` flow also supports `glm-4.7-flash`.

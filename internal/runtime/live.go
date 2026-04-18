@@ -80,6 +80,11 @@ type ToolUseRecord struct {
 	Input string `json:"input"`
 }
 
+type requestTokenObservation struct {
+	InputTokens  int
+	MessageCount int
+}
+
 type AutoCompaction struct {
 	RemovedMessages int    `json:"removed_messages"`
 	Notice          string `json:"notice"`
@@ -181,6 +186,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		Summary: "Preparing the runtime and session state.",
 	})
 	systemPrompt := buildSystemPrompt(h.Root)
+	tokenObservation := requestTokenObservation{}
 	for iteration := 0; iteration < max(1, opts.MaxIterations); iteration++ {
 		emitPromptProgress(opts, PromptProgress{
 			Phase:     PromptPhaseWaitingModel,
@@ -192,14 +198,18 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			Summary:   fmt.Sprintf("Waiting for model output on iteration %d.", iteration+1),
 			Iteration: iteration + 1,
 		})
+		streamState := newLiveStreamState(promptTurnID, iteration+1, opts)
+		toolDefinitions := liveRuntime.Definitions(opts.AllowedTools)
 		request := api.MessageRequest{
-			Model:     requestModel,
-			MaxTokens: max(256, opts.MaxTokens),
-			Messages:  append([]api.InputMessage(nil), session.Messages...),
-			System:    systemPrompt,
-			Tools:     liveRuntime.Definitions(opts.AllowedTools),
-			Stream:    true,
+			Model:         requestModel,
+			Messages:      append([]api.InputMessage(nil), session.Messages...),
+			System:        systemPrompt,
+			Tools:         toolDefinitions,
+			Stream:        true,
+			StreamHandler: streamState.Handle,
 		}
+		requestMessageCount := len(request.Messages)
+		request.MaxTokens = contextAwareMaxTokens(request, opts.MaxTokens, tokenObservation)
 		response, event, ok := cache.Lookup(request)
 		if ok {
 			summary.PromptCacheEvents = append(summary.PromptCacheEvents, event)
@@ -211,8 +221,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 				Iteration: iteration + 1,
 			})
 		} else {
-			streamState := newLiveStreamState(promptTurnID, iteration+1, opts)
-			response, err = liveRuntime.StreamMessage(ctx, client, request, streamState.Handle)
+			response, err = liveRuntime.StreamMessage(ctx, client, request)
 			if err != nil {
 				return PromptSummary{}, err
 			}
@@ -222,6 +231,10 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		}
 		summary.Iterations++
 		session.Meta.Usage = session.Meta.Usage.Add(response.Usage)
+		tokenObservation = requestTokenObservation{
+			InputTokens:  response.Usage.InputTokens + response.Usage.CacheCreationInputTokens + response.Usage.CacheReadInputTokens,
+			MessageCount: requestMessageCount,
+		}
 		if containsThinkingContent(response) {
 			emitActivity(opts, ActivityEvent{
 				Kind:      "model",
@@ -273,7 +286,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 				Detail:    compactJSON(call.Input),
 				Iteration: iteration + 1,
 			})
-			result := liveRuntime.ExecuteTool(ctx, call)
+			result := liveRuntime.ExecuteTool(ctx, call, iteration+1)
 			summary.ToolResults = append(summary.ToolResults, result)
 			emitActivity(opts, ActivityEvent{
 				Kind:      "tool_result",
@@ -502,7 +515,11 @@ func ReadPrompt(stdin io.Reader) (string, error) {
 
 func (h LiveHarness) loadOrCreateSession(opts PromptOptions) (sessions.ManagedSession, error) {
 	if strings.TrimSpace(opts.ResumeSession) != "" {
-		return sessions.LoadManaged(h.Root, opts.ResumeSession)
+		session, err := sessions.LoadManaged(h.Root, opts.ResumeSession)
+		if err != nil && os.IsNotExist(err) && sessions.IsLatestAlias(opts.ResumeSession) {
+			return sessions.NewManagedSession(newLiveSessionID(), opts.Model), nil
+		}
+		return session, err
 	}
 	return sessions.NewManagedSession(newLiveSessionID(), opts.Model), nil
 }
@@ -696,6 +713,112 @@ func costForTokens(tokens int, usdPerMillion float64) float64 {
 
 func formatUSD(amount float64) string {
 	return fmt.Sprintf("$%.2f", amount)
+}
+
+func contextAwareMaxTokens(request api.MessageRequest, requested int, observed requestTokenObservation) int {
+	desired := max(256, requested)
+	contextWindow := modelContextWindow(request.Model)
+	if contextWindow <= 0 {
+		return desired
+	}
+	estimatedInput := estimateRequestInputTokens(request)
+	if observed.InputTokens > 0 && observed.MessageCount >= 0 && observed.MessageCount <= len(request.Messages) {
+		estimatedInput = max(estimatedInput, observed.InputTokens+estimateMessagesInputTokens(request.Messages[observed.MessageCount:]))
+	}
+	remaining := contextWindow - estimatedInput - contextBudgetSafetyTokens(contextWindow)
+	switch {
+	case remaining >= desired:
+		return desired
+	case remaining > 0:
+		return remaining
+	default:
+		return 1
+	}
+}
+
+func modelContextWindow(model string) int {
+	normalized := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case normalized == "qwen3.6-30b-a3b", strings.Contains(normalized, "qwen3.6-35b-a3b"):
+		return 16384
+	case normalized == "glm-4.7-flash":
+		return 32768
+	default:
+		return 0
+	}
+}
+
+func contextBudgetSafetyTokens(contextWindow int) int {
+	return max(384, contextWindow/24)
+}
+
+func estimateRequestInputTokens(request api.MessageRequest) int {
+	total := estimateSystemTokenCount(request.System) + 24
+	total += estimateMessagesInputTokens(request.Messages)
+	total += estimateToolsInputTokens(request.Tools)
+	if request.ToolChoice != nil {
+		total += 16
+		total += estimateTokenCount(request.ToolChoice.Type)
+		total += estimateTokenCount(request.ToolChoice.Name)
+	}
+	return max(1, total)
+}
+
+func estimateMessagesInputTokens(messages []api.InputMessage) int {
+	total := 0
+	for _, message := range messages {
+		total += 12
+		total += estimateTokenCount(message.Role)
+		for _, block := range message.Content {
+			total += 8
+			total += estimateTokenCount(block.Type)
+			total += estimateTokenCount(block.Text)
+			total += estimateTokenCount(block.ID)
+			total += estimateTokenCount(block.Name)
+			total += estimateTokenCount(block.ToolUseID)
+			total += estimateRawJSONTokens(block.Input)
+			for _, item := range block.Content {
+				total += 4
+				total += estimateTokenCount(item.Type)
+				total += estimateTokenCount(item.Text)
+				total += estimateRawJSONTokens(item.Value)
+			}
+		}
+	}
+	return total
+}
+
+func estimateToolsInputTokens(tools []api.ToolDefinition) int {
+	total := 0
+	for _, tool := range tools {
+		total += 24
+		total += estimateTokenCount(tool.Name)
+		total += estimateSystemTokenCount(tool.Description)
+		total += estimateRawJSONTokens(tool.InputSchema)
+	}
+	return total
+}
+
+func estimateSystemTokenCount(text string) int {
+	return estimateTokenCountWithDivisor(text, 5)
+}
+
+func estimateTokenCount(text string) int {
+	return estimateTokenCountWithDivisor(text, 4)
+}
+
+func estimateTokenCountWithDivisor(text string, divisor int) int {
+	if strings.TrimSpace(text) == "" {
+		return 0
+	}
+	return (len(text) + divisor - 1) / divisor
+}
+
+func estimateRawJSONTokens(raw json.RawMessage) int {
+	if len(raw) == 0 {
+		return 0
+	}
+	return (len(raw) + 3) / 4
 }
 
 func applyAutoCompaction(session *sessions.ManagedSession, threshold int) *AutoCompaction {

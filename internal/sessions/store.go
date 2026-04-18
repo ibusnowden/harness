@@ -28,6 +28,13 @@ var latestAliases = map[string]struct{}{
 	"recent": {},
 }
 
+// IsLatestAlias reports whether reference is one of the built-in "latest session"
+// aliases ("latest", "last", "recent", "").
+func IsLatestAlias(reference string) bool {
+	_, ok := latestAliases[strings.ToLower(strings.TrimSpace(reference))]
+	return ok
+}
+
 type StoredSession struct {
 	SessionID    string   `json:"session_id"`
 	Messages     []string `json:"messages"`

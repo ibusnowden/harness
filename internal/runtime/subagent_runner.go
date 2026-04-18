@@ -108,7 +108,7 @@ func (r *liveRuntime) executeSubagent(ctx context.Context, assignment subagents.
 		envelopes := make([]api.ToolResultEnvelope, 0, len(calls))
 		for _, call := range calls {
 			trackSubagentFileUse(call, &inspected, &changed)
-			result := r.ExecuteTool(ctx, call)
+			result := r.ExecuteTool(ctx, call, 0)
 			envelopes = append(envelopes, api.ToolResultEnvelope{
 				ToolUseID: result.ToolUseID,
 				Output:    result.Output,

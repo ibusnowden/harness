@@ -106,6 +106,7 @@ func (c *Client) ProviderKind() ProviderKind {
 type streamAssembler struct {
 	response MessageResponse
 	blocks   map[int]*streamBlock
+	handler  func(StreamEvent)
 }
 
 type streamBlock struct {
@@ -304,6 +305,13 @@ func (a *streamAssembler) handle(eventName, payload string, emit func(StreamEven
 		return nil
 	}
 	return nil
+}
+
+func (a *streamAssembler) emit(event StreamEvent) {
+	if a.handler == nil {
+		return
+	}
+	a.handler(event)
 }
 
 func (a *streamAssembler) finalize() {

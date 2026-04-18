@@ -121,7 +121,7 @@ func (r *liveRuntime) Definitions(allowedTools []string) []api.ToolDefinition {
 	return definitions
 }
 
-func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall) tools.LiveResult {
+func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall, iteration int) tools.LiveResult {
 	rawInput := compactJSON(call.Input)
 	pre := r.hookRunner.RunPreToolUse(call.Name, rawInput)
 	if pre.Denied {
@@ -139,7 +139,7 @@ func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall) tool
 	if pre.PermissionOverride != "" {
 		permissionMode = pre.PermissionOverride
 	}
-	result := r.executeByKind(ctx, effectiveCall, permissionMode)
+	result := r.executeByKind(ctx, effectiveCall, permissionMode, iteration)
 	if result.IsError {
 		r.recordToolFailure(ctx, result.Name)
 		post := r.hookRunner.RunPostToolUseFailure(result.Name, rawInput, result.Output)
@@ -155,10 +155,10 @@ func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall) tool
 	return result
 }
 
-func (r *liveRuntime) StreamMessage(ctx context.Context, client api.MessageClient, request api.MessageRequest, emit func(api.StreamEvent)) (api.MessageResponse, error) {
+func (r *liveRuntime) StreamMessage(ctx context.Context, client api.MessageClient, request api.MessageRequest) (api.MessageResponse, error) {
 	attemptedRecovery := false
 	for {
-		response, err := client.StreamMessageEvents(ctx, request, emit)
+		response, err := client.StreamMessageEvents(ctx, request, request.StreamHandler)
 		if err != nil {
 			if attemptedRecovery {
 				return api.MessageResponse{}, err
@@ -270,11 +270,8 @@ func (r *liveRuntime) executeRecoveryStep(ctx context.Context, scenario recovery
 	}
 }
 
-func (r *liveRuntime) executeByKind(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode) tools.LiveResult {
-	return r.executeByKindWithAllowed(ctx, call, permissionMode, r.options.AllowedTools)
-}
-
-func (r *liveRuntime) executeByKindWithAllowed(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode, allowedTools []string) tools.LiveResult {
+func (r *liveRuntime) executeByKind(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode, iteration int) tools.LiveResult {
+	allowedTools := r.options.AllowedTools
 	if builtIn := tools.ExecuteLive(tools.LiveContext{
 		Root:            r.root,
 		Context:         ctx,
@@ -282,7 +279,7 @@ func (r *liveRuntime) executeByKindWithAllowed(ctx context.Context, call tools.L
 		AllowedToolName: toAllowMap(allowedTools),
 		Prompter:        r.options.Prompter,
 		Activity: func(event tools.LiveToolEvent) {
-			emitActivity(r.options, activityForToolEvent(event, 0))
+			emitActivity(r.options, activityForToolEvent(event, iteration))
 		},
 		DelegateTask: r.runSubagentAssignment,
 	}, call); !strings.HasPrefix(builtIn.Output, "unknown built-in tool:") || !builtIn.IsError {

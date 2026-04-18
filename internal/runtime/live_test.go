@@ -270,6 +270,105 @@ func TestLiveHarnessSendsDefaultSystemPrompt(t *testing.T) {
 	}
 }
 
+func TestLiveHarnessClampsMaxTokensForContextConstrainedQwenRequests(t *testing.T) {
+	var seenMaxTokens int
+	restoreTransport := api.SetTransportForTesting(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		data, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		var payload struct {
+			Model     string `json:"model"`
+			MaxTokens int    `json:"max_tokens"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		seenMaxTokens = payload.MaxTokens
+		if payload.Model != "qwen3.6-30b-a3b" {
+			t.Fatalf("unexpected model: %q", payload.Model)
+		}
+		return sseResponse(openAITextSSEForTest("ok")), nil
+	}))
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", "https://mock.openai.local/v1")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+
+	harness, err := NewLiveHarness(root)
+	if err != nil {
+		t.Fatalf("new live harness: %v", err)
+	}
+	_, err = harness.RunPrompt(context.Background(), strings.Repeat("alpha beta gamma delta\n", 3200), PromptOptions{
+		Model:          "qwen3.6-30b-a3b",
+		Provider:       api.ProviderOpenAI,
+		PermissionMode: tools.PermissionWorkspaceWrite,
+	})
+	if err != nil {
+		t.Fatalf("run prompt: %v", err)
+	}
+	if seenMaxTokens <= 0 {
+		t.Fatalf("expected a max_tokens value, got %d", seenMaxTokens)
+	}
+	if seenMaxTokens >= 4096 {
+		t.Fatalf("expected context-aware max_tokens clamp, got %d", seenMaxTokens)
+	}
+}
+
+func TestContextAwareMaxTokensLeavesRequestedBudgetWhenItFits(t *testing.T) {
+	request := api.MessageRequest{
+		Model:     "qwen3.6-30b-a3b",
+		MaxTokens: 4096,
+		System:    "Keep it short.",
+		Messages: []api.InputMessage{
+			api.UserTextMessage("Reply with exactly ok."),
+		},
+	}
+	if got := contextAwareMaxTokens(request, 4096, requestTokenObservation{}); got != 4096 {
+		t.Fatalf("expected unclamped max tokens, got %d", got)
+	}
+}
+
+func TestContextAwareMaxTokensUsesObservedInputTokensForLaterIterations(t *testing.T) {
+	request := api.MessageRequest{
+		Model:     "qwen3.6-30b-a3b",
+		MaxTokens: 4096,
+		System:    "Keep it short.",
+		Messages: []api.InputMessage{
+			api.UserTextMessage("Read the repo and explain the harness."),
+			{
+				Role: "assistant",
+				Content: []api.InputContentBlock{
+					{
+						Type:  "tool_use",
+						ID:    "toolu_1",
+						Name:  "read_file",
+						Input: json.RawMessage(`{"path":"README.md"}`),
+					},
+				},
+			},
+			api.ToolResultMessage([]api.ToolResultEnvelope{{
+				ToolUseID: "toolu_1",
+				Output:    strings.Repeat("alpha beta gamma delta\n", 600),
+			}}),
+		},
+	}
+	observed := requestTokenObservation{
+		InputTokens:  14950,
+		MessageCount: 1,
+	}
+	got := contextAwareMaxTokens(request, 4096, observed)
+	if got >= 4096 {
+		t.Fatalf("expected observed input tokens to clamp max tokens, got %d", got)
+	}
+	if got <= 0 {
+		t.Fatalf("expected positive max tokens, got %d", got)
+	}
+}
+
 func assertPromptPhases(t *testing.T, got, want []PromptPhase) {
 	t.Helper()
 	if len(got) != len(want) {
@@ -334,6 +433,19 @@ func finalTextSSEForTest(text string) string {
 		"",
 		`event: message_stop`,
 		`data: {"type":"message_stop"}`,
+		"",
+	}, "\n")
+}
+
+func openAITextSSEForTest(text string) string {
+	return strings.Join([]string{
+		`data: {"id":"chatcmpl_test","model":"qwen3.6-30b-a3b","choices":[{"delta":{"content":"` + text + `"}}]}`,
+		"",
+		`data: {"id":"chatcmpl_test","choices":[{"finish_reason":"stop"}]}`,
+		"",
+		`data: {"id":"chatcmpl_test","choices":[],"usage":{"prompt_tokens":12000,"completion_tokens":2}}`,
+		"",
+		`data: [DONE]`,
 		"",
 	}, "\n")
 }
