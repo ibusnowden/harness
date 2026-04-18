@@ -23,23 +23,23 @@ const (
 )
 
 type Assignment struct {
-	AssignmentID       string   `json:"assignment_id"`
-	WorkerID           string   `json:"worker_id"`
-	Role               string   `json:"role"`
-	Prompt             string   `json:"prompt"`
-	Context            string   `json:"context,omitempty"`
-	AllowedTools       []string `json:"allowed_tools,omitempty"`
-	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
-	Status             Status   `json:"status"`
-	CreatedAtMS        int64    `json:"created_at_ms"`
-	UpdatedAtMS        int64    `json:"updated_at_ms"`
-	StartedAtMS        int64    `json:"started_at_ms,omitempty"`
-	FinishedAtMS       int64    `json:"finished_at_ms,omitempty"`
-	ResultSummary      string   `json:"result_summary,omitempty"`
-	Error              string   `json:"error,omitempty"`
-	InspectedFiles     []string `json:"inspected_files,omitempty"`
-	ChangedFiles       []string `json:"changed_files,omitempty"`
-	Verification       string   `json:"verification,omitempty"`
+	AssignmentID       string    `json:"assignment_id"`
+	WorkerID           string    `json:"worker_id"`
+	Role               string    `json:"role"`
+	Prompt             string    `json:"prompt"`
+	Context            string    `json:"context,omitempty"`
+	AllowedTools       []string  `json:"allowed_tools,omitempty"`
+	AcceptanceCriteria []string  `json:"acceptance_criteria,omitempty"`
+	Status             Status    `json:"status"`
+	CreatedAtMS        int64     `json:"created_at_ms"`
+	UpdatedAtMS        int64     `json:"updated_at_ms"`
+	StartedAtMS        int64     `json:"started_at_ms,omitempty"`
+	FinishedAtMS       int64     `json:"finished_at_ms,omitempty"`
+	ResultSummary      string    `json:"result_summary,omitempty"`
+	Error              string    `json:"error,omitempty"`
+	InspectedFiles     []string  `json:"inspected_files,omitempty"`
+	ChangedFiles       []string  `json:"changed_files,omitempty"`
+	Verification       string    `json:"verification,omitempty"`
 	Usage              api.Usage `json:"usage"`
 }
 

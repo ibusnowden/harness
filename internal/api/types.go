@@ -149,4 +149,3 @@ type ToolResultEnvelope struct {
 	Output    string
 	IsError   bool
 }
-
