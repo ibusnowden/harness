@@ -57,10 +57,20 @@ func Create(root string, opts Options) (Plan, error) {
 	if err := persist(root, plan); err != nil {
 		return Plan{}, err
 	}
+	taskItems := make([]tasks.Task, 0, len(plan.Tasks))
 	for _, item := range plan.Tasks {
-		if _, err := tasks.Create(root, item.Title, item.BlockedBy); err != nil {
-			return Plan{}, err
-		}
+		taskItems = append(taskItems, tasks.Task{
+			ID:                 item.ID,
+			Title:              item.Title,
+			Goal:               item.Goal,
+			AcceptanceCriteria: append([]string(nil), item.AcceptanceCriteria...),
+			AllowedTools:       append([]string(nil), item.AllowedTools...),
+			Status:             tasks.StatusOpen,
+			BlockedBy:          append([]int(nil), item.BlockedBy...),
+		})
+	}
+	if err := tasks.Replace(root, taskItems); err != nil {
+		return Plan{}, err
 	}
 	return plan, nil
 }
@@ -92,7 +102,7 @@ func RenderMarkdown(plan Plan) string {
 		}
 		lines = append(lines, "", "Allowed tools: `"+strings.Join(task.AllowedTools, "`, `")+"`")
 	}
-	lines = append(lines, "", "Use `/proceed` after reviewing the plan, or edit `.ascaris/plans/"+plan.ID+".json` before execution wiring is enabled.")
+	lines = append(lines, "", "Use `/plan` approval in the TUI or `ascaris plan --execute ...` to run this task graph.")
 	return strings.Join(lines, "\n")
 }
 

@@ -60,10 +60,11 @@ type ActivityEvent struct {
 }
 
 type ApprovalRequest struct {
-	ToolName string
-	Input    string
-	Kind     string // "bash" (default) or "plan"
-	Response chan bool
+	ToolName    string
+	Input       string
+	Kind        string // "bash" (default) or "plan"
+	ExecutePlan bool
+	Response    chan bool
 }
 
 type TurnComplete struct {
@@ -88,22 +89,24 @@ type Notice struct {
 }
 
 type SlashResult struct {
-	Output         string
-	Error          bool
-	ResetState     bool
-	SessionID      string
-	UpdateModel    string // non-empty → update displayed model in header
-	UpdateProvider string // non-empty → update displayed provider in header
-	RunPrompt      string // non-empty → dispatch this as a new prompt turn
-	OutputKind     string // if set, overrides "system" transcript kind for custom rendering
+	Output              string
+	Error               bool
+	ResetState          bool
+	SessionID           string
+	UpdateModel         string // non-empty → update displayed model in header
+	UpdateProvider      string // non-empty → update displayed provider in header
+	RunPrompt           string // non-empty → dispatch this as a new prompt turn
+	RequestPlanApproval bool
+	OutputKind          string // if set, overrides "system" transcript kind for custom rendering
 }
 
 type Config struct {
-	In          io.Reader
-	Out         io.Writer
-	Status      Status
-	RunPrompt   func(context.Context, string, func(tea.Msg))
-	HandleSlash func(context.Context, string) SlashResult
+	In              io.Reader
+	Out             io.Writer
+	Status          Status
+	RunPrompt       func(context.Context, string, func(tea.Msg))
+	RunApprovedPlan func(context.Context, func(tea.Msg))
+	HandleSlash     func(context.Context, string) SlashResult
 }
 
 type transcriptEntry struct {
@@ -527,21 +530,37 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "y", "Y":
 			m.approval.Response <- true
 			label := "Approved by user."
+			var nextCmd tea.Cmd
 			if m.approval.Kind == "plan" {
 				label = "Plan approved. Executing…"
 				m.showTasks = true
 				m.showActivity = false
+				if m.approval.ExecutePlan && m.cfg.RunApprovedPlan != nil {
+					m.busy = true
+					m.spinVerb = "Working"
+					m.statusText = "Executing plan"
+					nextCmd = tea.Batch(runApprovedPlanCmd(m.ctx, m.cfg.RunApprovedPlan, m.eventCh), waitForRuntimeEvent(m.eventCh), spinnerTickCmd())
+				}
 			}
 			m.recordActivity(activityRecord{title: "Approval", summary: label, kind: "approval"})
 			m.approval = nil
-			m.statusText = "Working"
+			if nextCmd == nil {
+				m.statusText = "Working"
+			}
 			m.layout()
+			if nextCmd != nil {
+				return m, nextCmd
+			}
 			return m, waitForRuntimeEvent(m.eventCh)
 		case "n", "N", "esc":
 			m.approval.Response <- false
 			label := "Denied by user."
+			waitForEvent := true
 			if m.approval.Kind == "plan" {
 				label = "Plan adjustment requested."
+				if m.approval.ExecutePlan {
+					waitForEvent = false
+				}
 			}
 			m.recordActivity(activityRecord{title: "Approval", summary: label, kind: "approval", err: true})
 			m.approval = nil
@@ -549,7 +568,10 @@ func (m model) updateKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if msg.String() != "esc" {
 				m.focus = focusInput
 			}
-			return m, waitForRuntimeEvent(m.eventCh)
+			if waitForEvent {
+				return m, waitForRuntimeEvent(m.eventCh)
+			}
+			return m, nil
 		default:
 			return m, nil
 		}
@@ -840,6 +862,25 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 				detail:  m.startupNote,
 				kind:    "system",
 			})
+		}
+		if result.RequestPlanApproval {
+			taskData := "[]"
+			if tl, err := tasks.Load(m.taskRoot); err == nil {
+				m.taskList = tl.Tasks
+				m.lastTaskMod = tasks.ModTime(m.taskRoot)
+				if data, marshalErr := json.Marshal(tl.Tasks); marshalErr == nil {
+					taskData = string(data)
+				}
+			}
+			m.approval = &ApprovalRequest{
+				ToolName:    "plan_approval",
+				Input:       taskData,
+				Kind:        "plan",
+				ExecutePlan: true,
+				Response:    make(chan bool, 1),
+			}
+			m.statusText = "Approval required"
+			return m, nil
 		}
 		// If the slash command wants to dispatch a model turn, start it now.
 		if strings.TrimSpace(result.RunPrompt) != "" && !m.busy {
@@ -1936,6 +1977,15 @@ func (m model) prevFocus() focusTarget {
 func runPromptCmd(ctx context.Context, run func(context.Context, string, func(tea.Msg)), prompt string, events chan tea.Msg) tea.Cmd {
 	return func() tea.Msg {
 		run(ctx, prompt, func(msg tea.Msg) {
+			events <- msg
+		})
+		return nil
+	}
+}
+
+func runApprovedPlanCmd(ctx context.Context, run func(context.Context, func(tea.Msg)), events chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		run(ctx, func(msg tea.Msg) {
 			events <- msg
 		})
 		return nil

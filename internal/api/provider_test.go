@@ -175,6 +175,53 @@ func TestProviderClientStreamsOpenRouterEvents(t *testing.T) {
 	}
 }
 
+func TestProviderClientRejectsMalformedToolCallHistoryBeforeRequest(t *testing.T) {
+	transport := &captureTransport{
+		status:      200,
+		contentType: "text/event-stream",
+		body: strings.Join([]string{
+			`data: {"id":"chatcmpl_test","model":"gpt-4.1-mini","choices":[{"delta":{"content":"unused"}}]}`,
+			``,
+			`data: {"id":"chatcmpl_test","choices":[{"delta":{},"finish_reason":"stop"}]}`,
+			``,
+			`data: [DONE]`,
+			``,
+		}, "\n"),
+	}
+	restore := SetTransportForTesting(transport)
+	defer restore()
+	t.Setenv("OPENAI_API_KEY", "openai-test-key")
+	t.Setenv("OPENAI_BASE_URL", "https://openai.example/v1")
+
+	client, err := NewProviderClient("gpt-4.1-mini", ProviderConfig{})
+	if err != nil {
+		t.Fatalf("new provider client: %v", err)
+	}
+	_, err = client.StreamMessage(context.Background(), MessageRequest{
+		Model:     "gpt-4.1-mini",
+		MaxTokens: 256,
+		Messages: []InputMessage{
+			{
+				Role: "assistant",
+				Content: []InputContentBlock{
+					{
+						Type:  "tool_use",
+						ID:    "call_bad",
+						Name:  "write_file",
+						Input: json.RawMessage(`{"path":"broken.txt","content":"unterminated`),
+					},
+				},
+			},
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot send malformed tool call in conversation history") {
+		t.Fatalf("expected malformed tool history error, got %v", err)
+	}
+	if transport.lastRequest != nil {
+		t.Fatalf("expected request validation to fail before network call, got %#v", transport.lastRequest)
+	}
+}
+
 func TestProviderClientPrefersOpenRouterForSlashGrokModels(t *testing.T) {
 	transport := &captureTransport{
 		status:      200,

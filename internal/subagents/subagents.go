@@ -39,8 +39,9 @@ type Assignment struct {
 	Error              string    `json:"error,omitempty"`
 	InspectedFiles     []string  `json:"inspected_files,omitempty"`
 	ChangedFiles       []string  `json:"changed_files,omitempty"`
+	Blockers           []string  `json:"blockers,omitempty"`
 	Verification       string    `json:"verification,omitempty"`
-	Usage              api.Usage `json:"usage"`
+	TokenUsage         api.Usage `json:"token_usage"`
 }
 
 type Snapshot struct {
@@ -76,14 +77,15 @@ func (r *Registry) Complete(id string, result Result) (Assignment, error) {
 	assignment.ResultSummary = strings.TrimSpace(result.Summary)
 	assignment.InspectedFiles = cleanList(result.InspectedFiles)
 	assignment.ChangedFiles = cleanList(result.ChangedFiles)
+	assignment.Blockers = cleanList(result.Blockers)
 	assignment.Verification = strings.TrimSpace(result.Verification)
-	assignment.Usage = result.Usage
+	assignment.TokenUsage = result.TokenUsage
 	assignment.Error = ""
 	r.assignments[id] = assignment
 	return assignment, nil
 }
 
-func (r *Registry) Fail(id string, err error, usage api.Usage) (Assignment, error) {
+func (r *Registry) Fail(id string, err error, tokenUsage api.Usage) (Assignment, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	assignment, ok := r.assignments[id]
@@ -94,7 +96,7 @@ func (r *Registry) Fail(id string, err error, usage api.Usage) (Assignment, erro
 	assignment.Status = StatusFailed
 	assignment.FinishedAtMS = now
 	assignment.UpdatedAtMS = now
-	assignment.Usage = usage
+	assignment.TokenUsage = tokenUsage
 	if err != nil {
 		assignment.Error = err.Error()
 	}
@@ -106,8 +108,9 @@ type Result struct {
 	Summary        string
 	InspectedFiles []string
 	ChangedFiles   []string
+	Blockers       []string
 	Verification   string
-	Usage          api.Usage
+	TokenUsage     api.Usage
 }
 
 type Registry struct {

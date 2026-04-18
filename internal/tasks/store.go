@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 )
@@ -17,12 +18,15 @@ const (
 )
 
 type Task struct {
-	ID        int    `json:"id"`
-	Title     string `json:"title"`
-	Status    string `json:"status"`
-	BlockedBy []int  `json:"blocked_by,omitempty"`
-	Notes     string `json:"notes,omitempty"`
-	UpdatedMS int64  `json:"updated_at_ms"`
+	ID                 int      `json:"id"`
+	Title              string   `json:"title"`
+	Goal               string   `json:"goal,omitempty"`
+	AcceptanceCriteria []string `json:"acceptance_criteria,omitempty"`
+	AllowedTools       []string `json:"allowed_tools,omitempty"`
+	Status             string   `json:"status"`
+	BlockedBy          []int    `json:"blocked_by,omitempty"`
+	Notes              string   `json:"notes,omitempty"`
+	UpdatedMS          int64    `json:"updated_at_ms"`
 }
 
 type TaskList struct {
@@ -75,7 +79,7 @@ func save(root string, tl TaskList) error {
 	return os.Rename(tmp, path)
 }
 
-func Create(root, title string, blockedBy []int) (Task, error) {
+func Create(root, title, goal string, acceptanceCriteria, allowedTools []string, blockedBy []int) (Task, error) {
 	mu.Lock()
 	defer mu.Unlock()
 	tl, err := load(root)
@@ -83,11 +87,14 @@ func Create(root, title string, blockedBy []int) (Task, error) {
 		return Task{}, err
 	}
 	t := Task{
-		ID:        len(tl.Tasks) + 1,
-		Title:     title,
-		Status:    StatusOpen,
-		BlockedBy: blockedBy,
-		UpdatedMS: time.Now().UnixMilli(),
+		ID:                 len(tl.Tasks) + 1,
+		Title:              title,
+		Goal:               goal,
+		AcceptanceCriteria: cleanStrings(acceptanceCriteria),
+		AllowedTools:       cleanStrings(allowedTools),
+		Status:             StatusOpen,
+		BlockedBy:          blockedBy,
+		UpdatedMS:          time.Now().UnixMilli(),
 	}
 	tl.Tasks = append(tl.Tasks, t)
 	if err := save(root, tl); err != nil {
@@ -96,7 +103,36 @@ func Create(root, title string, blockedBy []int) (Task, error) {
 	return t, nil
 }
 
+func Replace(root string, items []Task) error {
+	mu.Lock()
+	defer mu.Unlock()
+	tl := TaskList{
+		Tasks:   make([]Task, 0, len(items)),
+		Version: 0,
+	}
+	now := time.Now().UnixMilli()
+	for index, item := range items {
+		item.ID = index + 1
+		item.Title = strings.TrimSpace(item.Title)
+		item.Goal = strings.TrimSpace(item.Goal)
+		item.AcceptanceCriteria = cleanStrings(item.AcceptanceCriteria)
+		item.AllowedTools = cleanStrings(item.AllowedTools)
+		item.Status = strings.TrimSpace(item.Status)
+		if item.Status == "" {
+			item.Status = StatusOpen
+		}
+		item.Notes = strings.TrimSpace(item.Notes)
+		item.UpdatedMS = now
+		tl.Tasks = append(tl.Tasks, item)
+	}
+	return save(root, tl)
+}
+
 func Update(root string, id int, status string) (Task, error) {
+	return UpdateWithNotes(root, id, status, "")
+}
+
+func UpdateWithNotes(root string, id int, status, notes string) (Task, error) {
 	switch status {
 	case StatusOpen, StatusInProgress, StatusDone, StatusCancelled:
 	default:
@@ -111,6 +147,7 @@ func Update(root string, id int, status string) (Task, error) {
 	for i, t := range tl.Tasks {
 		if t.ID == id {
 			tl.Tasks[i].Status = status
+			tl.Tasks[i].Notes = strings.TrimSpace(notes)
 			tl.Tasks[i].UpdatedMS = time.Now().UnixMilli()
 			if err := save(root, tl); err != nil {
 				return Task{}, err
@@ -148,4 +185,27 @@ func IsBlocked(t Task, all []Task) bool {
 		}
 	}
 	return false
+}
+
+func NextOpenUnblocked(all []Task) (Task, bool) {
+	for _, task := range all {
+		if task.Status != StatusOpen {
+			continue
+		}
+		if IsBlocked(task, all) {
+			continue
+		}
+		return task, true
+	}
+	return Task{}, false
+}
+
+func cleanStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }

@@ -30,7 +30,11 @@ func (c *OpenAICompatClient) StreamMessage(ctx context.Context, request MessageR
 }
 
 func (c *OpenAICompatClient) StreamMessageEvents(ctx context.Context, request MessageRequest, emit func(StreamEvent)) (MessageResponse, error) {
-	payload, err := json.Marshal(toOpenAIRequest(request))
+	openAIRequest, err := toOpenAIRequest(request)
+	if err != nil {
+		return MessageResponse{}, err
+	}
+	payload, err := json.Marshal(openAIRequest)
 	if err != nil {
 		return MessageResponse{}, err
 	}
@@ -70,7 +74,7 @@ func normalizeChatCompletionsURL(baseURL string) string {
 	return baseURL + "/chat/completions"
 }
 
-func toOpenAIRequest(request MessageRequest) map[string]any {
+func toOpenAIRequest(request MessageRequest) (map[string]any, error) {
 	messages := make([]map[string]any, 0, len(request.Messages)+1)
 	if strings.TrimSpace(request.System) != "" {
 		messages = append(messages, map[string]any{
@@ -79,7 +83,11 @@ func toOpenAIRequest(request MessageRequest) map[string]any {
 		})
 	}
 	for _, message := range request.Messages {
-		messages = append(messages, convertOpenAIMessages(message)...)
+		converted, err := convertOpenAIMessages(message)
+		if err != nil {
+			return nil, err
+		}
+		messages = append(messages, converted...)
 	}
 	payload := map[string]any{
 		"model":          request.Model,
@@ -116,10 +124,10 @@ func toOpenAIRequest(request MessageRequest) map[string]any {
 			}
 		}
 	}
-	return payload
+	return payload, nil
 }
 
-func convertOpenAIMessages(message InputMessage) []map[string]any {
+func convertOpenAIMessages(message InputMessage) ([]map[string]any, error) {
 	textParts := []string{}
 	toolCalls := []map[string]any{}
 	toolMessages := []map[string]any{}
@@ -130,12 +138,16 @@ func convertOpenAIMessages(message InputMessage) []map[string]any {
 				textParts = append(textParts, block.Text)
 			}
 		case "tool_use":
+			arguments, err := normalizeToolCallArgumentsRaw(block.Input, block.Name, block.ID)
+			if err != nil {
+				return nil, fmt.Errorf("cannot send malformed tool call in conversation history: %w", err)
+			}
 			toolCalls = append(toolCalls, map[string]any{
 				"id":   block.ID,
 				"type": "function",
 				"function": map[string]any{
 					"name":      block.Name,
-					"arguments": compactRawJSON(block.Input),
+					"arguments": string(arguments),
 				},
 			})
 		case "tool_result":
@@ -156,7 +168,7 @@ func convertOpenAIMessages(message InputMessage) []map[string]any {
 		}
 	}
 	if len(toolMessages) > 0 {
-		return toolMessages
+		return toolMessages, nil
 	}
 	out := map[string]any{"role": message.Role}
 	if len(textParts) > 0 {
@@ -167,7 +179,7 @@ func convertOpenAIMessages(message InputMessage) []map[string]any {
 	if len(toolCalls) > 0 {
 		out["tool_calls"] = toolCalls
 	}
-	return []map[string]any{out}
+	return []map[string]any{out}, nil
 }
 
 func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse, error) {
@@ -297,7 +309,10 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 	sort.Ints(indices)
 	for _, index := range indices {
 		call := toolCalls[index]
-		input := json.RawMessage(compactJSONString(call.Arguments.String()))
+		input, err := normalizeToolCallArgumentsString(call.Arguments.String(), call.Name, call.ID)
+		if err != nil {
+			return MessageResponse{}, err
+		}
 		content = append(content, OutputContentBlock{
 			Type:  "tool_use",
 			ID:    call.ID,
@@ -331,11 +346,15 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 				}
 			}
 			for i, tc := range extracted {
+				input, err := normalizeToolCallArgumentsString(tc.arguments, tc.name, fmt.Sprintf("fallback-%d", i))
+				if err != nil {
+					return MessageResponse{}, err
+				}
 				rebuilt = append(rebuilt, OutputContentBlock{
 					Type:  "tool_use",
 					ID:    fmt.Sprintf("fallback-%d", i),
 					Name:  tc.name,
-					Input: json.RawMessage(compactJSONString(tc.arguments)),
+					Input: input,
 				})
 			}
 			content = rebuilt
@@ -350,12 +369,16 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 		}
 		if len(extractedTextToolCalls) > 0 {
 			for index, call := range extractedTextToolCalls {
+				input, err := normalizeToolCallArgumentsString(call.arguments, call.name, fmt.Sprintf("fallback-%d", index))
+				if err != nil {
+					return MessageResponse{}, err
+				}
 				emitStreamEvent(emit, StreamEvent{
 					Type:          "tool_call_ready",
 					ToolCallIndex: index,
 					ToolCallID:    fmt.Sprintf("fallback-%d", index),
 					ToolName:      call.name,
-					ToolInput:     json.RawMessage(compactJSONString(call.arguments)),
+					ToolInput:     input,
 				})
 			}
 		}
@@ -423,13 +446,6 @@ func rawJSONOrEmptyObject(raw json.RawMessage) any {
 		return value
 	}
 	return map[string]any{}
-}
-
-func compactRawJSON(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return "{}"
-	}
-	return compactJSONString(string(raw))
 }
 
 func compactJSONString(value string) string {

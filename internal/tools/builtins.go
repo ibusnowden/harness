@@ -76,11 +76,13 @@ func LiveDefinitions(allowedTools []string) []api.ToolDefinition {
 		toolDefinition("web_search", "Search the web when ASCARIS_ENABLE_WEB=1", `{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}`),
 		toolDefinition("web_fetch", "Fetch a web page when ASCARIS_ENABLE_WEB=1", `{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["url"],"additionalProperties":false}`),
 		toolDefinition("bash", "Execute a shell command", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"],"additionalProperties":false}`),
-		toolDefinition("task_create", "Create a task in the workspace task list", `{"type":"object","properties":{"title":{"type":"string"},"blocked_by":{"type":"array","items":{"type":"integer"}}},"required":["title"],"additionalProperties":false}`),
+		toolDefinition("task_create", "Create a task contract in the workspace task list", `{"type":"object","properties":{"title":{"type":"string"},"goal":{"type":"string"},"acceptance_criteria":{"type":"array","items":{"type":"string"}},"allowed_tools":{"type":"array","items":{"type":"string"}},"blocked_by":{"type":"array","items":{"type":"integer"}}},"required":["title"],"additionalProperties":false}`),
 		toolDefinition("task_update", "Update the status of a task (open, in_progress, done, cancelled)", `{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"string"}},"required":["id","status"],"additionalProperties":false}`),
 		toolDefinition("task_list", "List all tasks in the workspace task list", `{"type":"object","properties":{},"additionalProperties":false}`),
 		toolDefinition("request_plan_approval", "Show the task list to the user and request approval before implementing. Call this after creating all tasks.", `{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`),
-		toolDefinition("delegate_task", "Create a scoped subagent assignment and worker lane. Returns pending assignment state for an external runner.", `{"type":"object","properties":{"role":{"type":"string"},"prompt":{"type":"string"},"context":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}}},"required":["prompt"],"additionalProperties":false}`),
+		toolDefinition("delegate_task", "Create a scoped subagent assignment and worker lane, run it immediately when a live runner is available, and return the final assignment state.", `{"type":"object","properties":{"role":{"type":"string"},"prompt":{"type":"string"},"context":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}}},"required":["prompt"],"additionalProperties":false}`),
+		toolDefinition("subagent_list", "List all subagent assignments and their status", `{"type":"object","properties":{},"additionalProperties":false}`),
+		toolDefinition("subagent_get", "Get a subagent assignment by ID", `{"type":"object","properties":{"assignment_id":{"type":"string"}},"required":["assignment_id"],"additionalProperties":false}`),
 	}
 	definitions = append(definitions, controlPlaneDefinitions()...)
 	if len(allowed) == 0 {
@@ -133,6 +135,10 @@ func ExecuteLive(ctx LiveContext, call LiveCall) LiveResult {
 		return executeRequestPlanApproval(ctx, call)
 	case "delegate_task":
 		return executeDelegateTask(ctx, call)
+	case "subagent_list":
+		return executeSubagentList(ctx, call)
+	case "subagent_get":
+		return executeSubagentGet(ctx, call)
 	default:
 		if result, ok := executeControlPlaneTool(ctx, call); ok {
 			return result
@@ -733,8 +739,11 @@ func emitToolActivity(ctx LiveContext, event LiveToolEvent) {
 
 func executeTaskCreate(ctx LiveContext, call LiveCall) LiveResult {
 	var input struct {
-		Title     string `json:"title"`
-		BlockedBy []int  `json:"blocked_by"`
+		Title              string   `json:"title"`
+		Goal               string   `json:"goal"`
+		AcceptanceCriteria []string `json:"acceptance_criteria"`
+		AllowedTools       []string `json:"allowed_tools"`
+		BlockedBy          []int    `json:"blocked_by"`
 	}
 	if err := json.Unmarshal(call.Input, &input); err != nil {
 		return liveError(call, "invalid task_create input: "+err.Error())
@@ -742,7 +751,7 @@ func executeTaskCreate(ctx LiveContext, call LiveCall) LiveResult {
 	if strings.TrimSpace(input.Title) == "" {
 		return liveError(call, "task title is required")
 	}
-	t, err := tasks.Create(ctx.Root, strings.TrimSpace(input.Title), input.BlockedBy)
+	t, err := tasks.Create(ctx.Root, strings.TrimSpace(input.Title), strings.TrimSpace(input.Goal), input.AcceptanceCriteria, input.AllowedTools, input.BlockedBy)
 	if err != nil {
 		return liveError(call, "task_create: "+err.Error())
 	}
@@ -751,7 +760,14 @@ func executeTaskCreate(ctx LiveContext, call LiveCall) LiveResult {
 		Title:   fmt.Sprintf("task #%d created", t.ID),
 		Summary: t.Title,
 	})
-	result := map[string]any{"id": t.ID, "title": t.Title, "status": t.Status}
+	result := map[string]any{
+		"id":                  t.ID,
+		"title":               t.Title,
+		"goal":                t.Goal,
+		"acceptance_criteria": t.AcceptanceCriteria,
+		"allowed_tools":       t.AllowedTools,
+		"status":              t.Status,
+	}
 	return liveJSON(call, result)
 }
 
@@ -818,8 +834,40 @@ func executeRequestPlanApproval(ctx LiveContext, call LiveCall) LiveResult {
 	return LiveResult{
 		ToolUseID: call.ID,
 		Name:      call.Name,
-		Output:    `{"approved":true,"message":"Plan approved. Begin executing all tasks now following the Agentic Task Execution protocol. Start with task #1."}`,
+		Output:    `{"approved":true,"orchestrator_mode":true,"message":"Plan approved. The runtime will execute the approved task graph through scoped subagents. In orchestrator mode, do not directly implement code with file, shell, or edit tools."}`,
 	}
+}
+
+func executeSubagentList(ctx LiveContext, call LiveCall) LiveResult {
+	registry, err := subagents.LoadRegistry(ctx.Root)
+	if err != nil {
+		return liveError(call, "subagent_list: "+err.Error())
+	}
+	data, _ := json.Marshal(registry.Snapshot().Assignments)
+	return LiveResult{ToolUseID: call.ID, Name: call.Name, Output: string(data)}
+}
+
+func executeSubagentGet(ctx LiveContext, call LiveCall) LiveResult {
+	var input struct {
+		AssignmentID string `json:"assignment_id"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid subagent_get input: "+err.Error())
+	}
+	if strings.TrimSpace(input.AssignmentID) == "" {
+		return liveError(call, "subagent_get assignment_id is required")
+	}
+	registry, err := subagents.LoadRegistry(ctx.Root)
+	if err != nil {
+		return liveError(call, "subagent_get: "+err.Error())
+	}
+	for _, a := range registry.Snapshot().Assignments {
+		if a.AssignmentID == strings.TrimSpace(input.AssignmentID) {
+			data, _ := json.Marshal(a)
+			return LiveResult{ToolUseID: call.ID, Name: call.Name, Output: string(data)}
+		}
+	}
+	return liveError(call, "subagent assignment not found: "+strings.TrimSpace(input.AssignmentID))
 }
 
 func executeDelegateTask(ctx LiveContext, call LiveCall) LiveResult {
@@ -869,7 +917,7 @@ func executeDelegateTask(ctx LiveContext, call LiveCall) LiveResult {
 		}
 		assignment, err = ctx.DelegateTask(runCtx, assignment)
 		if err != nil {
-			return liveError(call, err.Error())
+			return liveDelegateError(call, assignment, string(worker.Status), err)
 		}
 	}
 	emitToolActivity(ctx, LiveToolEvent{
@@ -888,8 +936,52 @@ func executeDelegateTask(ctx LiveContext, call LiveCall) LiveResult {
 		"acceptance_criteria": assignment.AcceptanceCriteria,
 		"result_summary":      assignment.ResultSummary,
 		"error":               assignment.Error,
+		"blockers":            assignment.Blockers,
 		"verification":        assignment.Verification,
+		"token_usage":         assignment.TokenUsage,
 		"worker_status":       worker.Status,
-		"message":             "subagent assignment recorded",
+		"message":             delegateMessage(assignment, ctx.DelegateTask != nil),
 	})
+}
+
+func delegateMessage(assignment subagents.Assignment, ranNow bool) string {
+	switch {
+	case !ranNow:
+		return "subagent assignment recorded"
+	case assignment.Status == subagents.StatusCompleted:
+		return "subagent assignment completed"
+	case assignment.Status == subagents.StatusFailed:
+		return "subagent assignment failed"
+	default:
+		return "subagent assignment updated"
+	}
+}
+
+func liveDelegateError(call LiveCall, assignment subagents.Assignment, workerStatus string, err error) LiveResult {
+	payload := map[string]any{
+		"assignment_id": assignment.AssignmentID,
+		"worker_id":     assignment.WorkerID,
+		"status":        assignment.Status,
+		"error":         err.Error(),
+		"worker_status": workerStatus,
+	}
+	if assignment.ResultSummary != "" {
+		payload["result_summary"] = assignment.ResultSummary
+	}
+	if len(assignment.Blockers) > 0 {
+		payload["blockers"] = assignment.Blockers
+	}
+	if assignment.Verification != "" {
+		payload["verification"] = assignment.Verification
+	}
+	if assignment.TokenUsage != (api.Usage{}) {
+		payload["token_usage"] = assignment.TokenUsage
+	}
+	data, _ := json.Marshal(payload)
+	return LiveResult{
+		ToolUseID: call.ID,
+		Name:      call.Name,
+		Output:    string(data),
+		IsError:   true,
+	}
 }

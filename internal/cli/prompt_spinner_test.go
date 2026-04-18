@@ -11,11 +11,19 @@ import (
 )
 
 type spinnerHarnessStub struct {
-	run func(context.Context, string, hruntime.PromptOptions) (hruntime.PromptSummary, error)
+	run  func(context.Context, string, hruntime.PromptOptions) (hruntime.PromptSummary, error)
+	exec func(context.Context, hruntime.PromptOptions) (hruntime.PromptSummary, error)
 }
 
 func (s spinnerHarnessStub) RunPrompt(ctx context.Context, prompt string, opts hruntime.PromptOptions) (hruntime.PromptSummary, error) {
 	return s.run(ctx, prompt, opts)
+}
+
+func (s spinnerHarnessStub) ExecutePlan(ctx context.Context, opts hruntime.PromptOptions) (hruntime.PromptSummary, error) {
+	if s.exec != nil {
+		return s.exec(ctx, opts)
+	}
+	return hruntime.PromptSummary{}, nil
 }
 
 type spinnerStub struct {

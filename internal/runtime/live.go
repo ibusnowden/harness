@@ -199,7 +199,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			Iteration: iteration + 1,
 		})
 		streamState := newLiveStreamState(promptTurnID, iteration+1, opts)
-		toolDefinitions := liveRuntime.Definitions(opts.AllowedTools)
+		toolDefinitions := liveRuntime.Definitions(liveRuntime.effectiveTools())
 		request := api.MessageRequest{
 			Model:         requestModel,
 			Messages:      append([]api.InputMessage(nil), session.Messages...),
@@ -278,7 +278,32 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			ToolCount: len(liveCalls),
 		})
 		envelopes := make([]api.ToolResultEnvelope, 0, len(liveCalls))
+		hasPlanApprovalCall := containsToolCallNamed(liveCalls, "request_plan_approval")
+		planApproved := false
 		for _, call := range liveCalls {
+			if hasPlanApprovalCall && call.Name != "request_plan_approval" {
+				result := tools.LiveResult{
+					ToolUseID: call.ID,
+					Name:      call.Name,
+					Output:    "tool call skipped: request_plan_approval must be the only tool executed in that response; the runtime executes approved plans directly",
+					IsError:   true,
+				}
+				summary.ToolResults = append(summary.ToolResults, result)
+				emitActivity(opts, ActivityEvent{
+					Kind:      "tool_result",
+					Title:     result.Name,
+					Summary:   summarizeToolResult(result),
+					Detail:    result.Output,
+					Error:     true,
+					Iteration: iteration + 1,
+				})
+				envelopes = append(envelopes, api.ToolResultEnvelope{
+					ToolUseID: result.ToolUseID,
+					Output:    result.Output,
+					IsError:   true,
+				})
+				continue
+			}
 			emitActivity(opts, ActivityEvent{
 				Kind:      "tool_start",
 				Title:     call.Name,
@@ -288,6 +313,10 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			})
 			result := liveRuntime.ExecuteTool(ctx, call, iteration+1)
 			summary.ToolResults = append(summary.ToolResults, result)
+			if call.Name == "request_plan_approval" && strings.Contains(result.Output, `"orchestrator_mode":true`) {
+				liveRuntime.orchestratorTools = []string{"delegate_task", "subagent_get", "subagent_list", "request_plan_approval"}
+				planApproved = true
+			}
 			emitActivity(opts, ActivityEvent{
 				Kind:      "tool_result",
 				Title:     result.Name,
@@ -303,6 +332,27 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			})
 		}
 		session.Messages = append(session.Messages, api.ToolResultMessage(envelopes))
+		if planApproved {
+			planSummary, planErr := liveRuntime.executeApprovedPlan(ctx)
+			summary.ToolResults = append(summary.ToolResults, planSummary.ToolResults...)
+			session.Meta.Usage = session.Meta.Usage.Add(planSummary.Usage)
+			summary.Usage = session.Meta.Usage
+			summary.EstimatedCost = formatUSD(estimateCost(summary.Usage, opts.Model))
+			summary.Message = planSummary.Message
+			if planErr != nil {
+				emitActivity(opts, ActivityEvent{
+					Kind:    "status",
+					Title:   "Plan Stopped",
+					Summary: "Approved plan execution stopped early.",
+					Detail:  planErr.Error(),
+					Error:   true,
+				})
+			}
+			if _, err := sessions.SaveManaged(session, h.Root); err != nil {
+				return PromptSummary{}, err
+			}
+			return summary, nil
+		}
 	}
 	emitPromptProgress(opts, PromptProgress{
 		Phase:     PromptPhaseFinalizing,
@@ -494,6 +544,15 @@ func containsThinkingContent(response api.MessageResponse) bool {
 	return false
 }
 
+func containsToolCallNamed(calls []tools.LiveCall, name string) bool {
+	for _, call := range calls {
+		if call.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (s PromptSummary) JSON() string {
 	data, err := json.Marshal(s)
 	if err != nil {
@@ -650,17 +709,13 @@ func defaultSystemPrompt() string {
 		// Agentic Task Execution
 		"## Agentic Task Execution\n" +
 			"When the user approves a plan (responds with 'yes', 'proceed', 'go ahead', 'begin', '/proceed', or any equivalent confirmation), " +
-			"you MUST immediately begin executing the task list. Do not re-explain the plan or ask for further confirmation.\n\n" +
-			"Execution protocol — repeat until all tasks are done:\n" +
-			"1. Call task_list() to get the current task state.\n" +
-			"2. Find the first task with status 'open' that is not blocked (all its blocked_by tasks are 'done').\n" +
-			"3. Call task_update(id, 'in_progress') to mark it started.\n" +
-			"4. Implement the task fully: read relevant files, write or edit code, run tests with bash.\n" +
-			"5. Call task_update(id, 'done') once the work is complete and verified.\n" +
-			"6. Move immediately to the next open task — do NOT pause between tasks to ask permission.\n" +
-			"7. Only stop and ask the user if you hit a genuine blocker that cannot be resolved with available tools.\n\n" +
-			"This is the core execution loop. A task is only 'done' when the actual code change has been made and verified, " +
-			"not when you have described what to do. Write real code, edit real files, run real commands.",
+			"you MUST immediately begin executing the approved task graph. Do not re-explain the plan or ask for further confirmation.\n\n" +
+			"Planning protocol:\n" +
+			"1. Create task contracts with task_create(title, goal, acceptance_criteria, allowed_tools, blocked_by).\n" +
+			"2. Call request_plan_approval(summary) only after the task graph is complete.\n" +
+			"3. After approval, the runtime executes the approved tasks through scoped subagents.\n" +
+			"4. In orchestrator mode, do not directly implement code with file, shell, or edit tools.\n\n" +
+			"A task is only complete when the delegated subagent returns a verified result or a blocker is surfaced explicitly.",
 	}, "\n\n")
 }
 

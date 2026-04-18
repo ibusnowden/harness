@@ -24,16 +24,24 @@ import (
 )
 
 type liveRuntime struct {
-	root           string
-	config         config.RuntimeConfig
-	options        PromptOptions
-	currentPrompt  string
-	pluginManager  plugins.Manager
-	pluginTools    []plugins.ToolDefinition
-	mcpRegistry    *mcp.Registry
-	hookRunner     hooks.Runner
-	workerRegistry *workerstate.Registry
-	workerID       string
+	root              string
+	config            config.RuntimeConfig
+	options           PromptOptions
+	currentPrompt     string
+	pluginManager     plugins.Manager
+	pluginTools       []plugins.ToolDefinition
+	mcpRegistry       *mcp.Registry
+	hookRunner        hooks.Runner
+	workerRegistry    *workerstate.Registry
+	workerID          string
+	orchestratorTools []string // non-nil when orchestrator mode is active
+}
+
+func (r *liveRuntime) effectiveTools() []string {
+	if len(r.orchestratorTools) > 0 {
+		return r.orchestratorTools
+	}
+	return r.options.AllowedTools
 }
 
 func newLiveRuntime(root string, runtimeConfig config.RuntimeConfig, options PromptOptions, prompt string) (*liveRuntime, error) {
@@ -122,6 +130,14 @@ func (r *liveRuntime) Definitions(allowedTools []string) []api.ToolDefinition {
 }
 
 func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall, iteration int) tools.LiveResult {
+	return r.executeToolWithAllowed(ctx, call, iteration, r.effectiveTools())
+}
+
+func (r *liveRuntime) ExecuteToolWithAllowed(ctx context.Context, call tools.LiveCall, iteration int, allowedTools []string) tools.LiveResult {
+	return r.executeToolWithAllowed(ctx, call, iteration, allowedTools)
+}
+
+func (r *liveRuntime) executeToolWithAllowed(ctx context.Context, call tools.LiveCall, iteration int, allowedTools []string) tools.LiveResult {
 	rawInput := compactJSON(call.Input)
 	pre := r.hookRunner.RunPreToolUse(call.Name, rawInput)
 	if pre.Denied {
@@ -139,7 +155,7 @@ func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall, iter
 	if pre.PermissionOverride != "" {
 		permissionMode = pre.PermissionOverride
 	}
-	result := r.executeByKind(ctx, effectiveCall, permissionMode, iteration)
+	result := r.executeByKind(ctx, effectiveCall, permissionMode, iteration, allowedTools)
 	if result.IsError {
 		r.recordToolFailure(ctx, result.Name)
 		post := r.hookRunner.RunPostToolUseFailure(result.Name, rawInput, result.Output)
@@ -270,8 +286,7 @@ func (r *liveRuntime) executeRecoveryStep(ctx context.Context, scenario recovery
 	}
 }
 
-func (r *liveRuntime) executeByKind(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode, iteration int) tools.LiveResult {
-	allowedTools := r.options.AllowedTools
+func (r *liveRuntime) executeByKind(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode, iteration int, allowedTools []string) tools.LiveResult {
 	if builtIn := tools.ExecuteLive(tools.LiveContext{
 		Root:            r.root,
 		Context:         ctx,

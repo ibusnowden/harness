@@ -66,6 +66,7 @@ type globalOptions struct {
 
 type livePromptHarness interface {
 	RunPrompt(context.Context, string, hruntime.PromptOptions) (hruntime.PromptSummary, error)
+	ExecutePlan(context.Context, hruntime.PromptOptions) (hruntime.PromptSummary, error)
 }
 
 type promptSpinner interface {
@@ -198,7 +199,7 @@ func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) 
 	case "review":
 		return runSecurityWorkflow(ctx, securityreview.ModeReview, securityreview.WorkflowSource, remaining[1:], stdout, stderr)
 	case "plan":
-		return runPlanCommand(ctx, remaining[1:], stdout, stderr)
+		return runPlanCommand(ctx, options, remaining[1:], stdin, stdout, stderr)
 	case "security-review":
 		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowAuto, remaining[1:], stdout, stderr)
 	case "bughunter":
@@ -390,10 +391,11 @@ func runSecurityWorkflow(ctx Context, mode securityreview.Mode, defaultWorkflow 
 	return 0
 }
 
-func runPlanCommand(ctx Context, args []string, stdout, stderr io.Writer) int {
+func runPlanCommand(ctx Context, options globalOptions, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	jsonOut := fs.Bool("json", false, "")
+	execute := fs.Bool("execute", false, "")
 	if err := fs.Parse(args); err != nil {
 		return fail(stderr, err)
 	}
@@ -408,6 +410,18 @@ func runPlanCommand(ctx Context, args []string, stdout, stderr io.Writer) int {
 	if *jsonOut {
 		data, _ := json.MarshalIndent(plan, "", "  ")
 		_, _ = fmt.Fprintln(stdout, string(data))
+		return 0
+	}
+	if *execute {
+		harness, err := newLiveHarness(ctx.Root)
+		if err != nil {
+			return fail(stderr, err)
+		}
+		summary, err := runApprovedPlan(harness, options, stdin, stdout, stderr)
+		if err != nil {
+			return fail(stderr, err)
+		}
+		_, _ = fmt.Fprintln(stdout, summary.Message)
 		return 0
 	}
 	_, _ = fmt.Fprintln(stdout, planning.RenderMarkdown(plan))
@@ -784,6 +798,38 @@ func runInteractiveREPL(ctx Context, options globalOptions, stdin io.Reader, std
 				CostEst:   summary.EstimatedCost,
 			})
 		},
+		RunApprovedPlan: func(runCtx context.Context, emit func(tea.Msg)) {
+			summary, err := harness.ExecutePlan(runCtx, hruntime.PromptOptions{
+				Model:          options.Model,
+				Provider:       options.Provider,
+				PermissionMode: options.PermissionMode,
+				AllowedTools:   options.AllowedTools,
+				Prompter:       tuiApprovalPrompter{emit: emit},
+				Activity: func(activity hruntime.ActivityEvent) {
+					emit(repl.ActivityEvent{
+						Kind:    activity.Kind,
+						Title:   activity.Title,
+						Summary: activity.Summary,
+						Detail:  activity.Detail,
+						Error:   activity.Error,
+						EntryID: activity.EntryID,
+					})
+				},
+			})
+			if err != nil {
+				emit(repl.TurnFailed{Message: err.Error()})
+				return
+			}
+			emit(repl.TurnComplete{
+				Message:   summary.Message,
+				SessionID: resolveSessionLabel(ctx.Root, sessionRef),
+				Model:     fallbackString(summary.Model, options.Model),
+				Provider:  summary.Provider,
+				TokensIn:  summary.Usage.InputTokens + summary.Usage.CacheCreationInputTokens + summary.Usage.CacheReadInputTokens,
+				TokensOut: summary.Usage.OutputTokens,
+				CostEst:   summary.EstimatedCost,
+			})
+		},
 		HandleSlash: func(_ context.Context, line string) repl.SlashResult {
 			result := runSlashInTUI(ctx, options, line)
 			switch {
@@ -960,7 +1006,8 @@ func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashRe
 				return repl.SlashResult{Output: err.Error(), Error: true}
 			}
 			return repl.SlashResult{
-				Output: planning.RenderMarkdown(plan),
+				Output:              planning.RenderMarkdown(plan),
+				RequestPlanApproval: true,
 			}
 		case "/memory":
 			return runMemorySlashResult(ctx, args[1:])
@@ -1015,6 +1062,28 @@ func runLivePrompt(harness livePromptHarness, root, prompt string, options globa
 		}
 	}
 	summary, err := harness.RunPrompt(context.Background(), prompt, promptOptions)
+	if spinner != nil {
+		spinner.Stop()
+	}
+	return summary, err
+}
+
+func runApprovedPlan(harness livePromptHarness, options globalOptions, stdin io.Reader, stdout, stderr io.Writer) (hruntime.PromptSummary, error) {
+	promptOptions := hruntime.PromptOptions{
+		Model:          options.Model,
+		Provider:       options.Provider,
+		PermissionMode: options.PermissionMode,
+		AllowedTools:   options.AllowedTools,
+	}
+	basePrompter := stdioPrompter{stdin: stdin, stdout: stdout}
+	promptOptions.Prompter = basePrompter
+	var spinner *spinnerController
+	if options.OutputFormat == "text" && isInteractiveWriter(stderr) {
+		spinner = newSpinnerController(newPromptSpinner(stderr))
+		spinner.Start("Executing approved plan")
+		promptOptions.Prompter = spinnerAwarePrompter{base: basePrompter, spinner: spinner}
+	}
+	summary, err := harness.ExecutePlan(context.Background(), promptOptions)
 	if spinner != nil {
 		spinner.Stop()
 	}

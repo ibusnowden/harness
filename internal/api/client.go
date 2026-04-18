@@ -160,7 +160,9 @@ func parseSSE(body io.Reader, emit func(StreamEvent)) (MessageResponse, error) {
 	if err := flush(); err != nil {
 		return MessageResponse{}, err
 	}
-	assembler.finalize()
+	if err := assembler.finalize(); err != nil {
+		return MessageResponse{}, err
+	}
 	emitStreamEvent(emit, StreamEvent{
 		Type:       "message_stop",
 		StopReason: assembler.response.StopReason,
@@ -269,9 +271,9 @@ func (a *streamAssembler) handle(eventName, payload string, emit func(StreamEven
 		if block, ok := a.blocks[event.Index]; ok {
 			block.Closed = true
 			if block.Type == "tool_use" {
-				input := json.RawMessage(`{}`)
-				if block.Input.Len() > 0 {
-					input = json.RawMessage(block.Input.String())
+				input, err := normalizeToolCallArgumentsString(block.Input.String(), block.Name, block.ID)
+				if err != nil {
+					return err
 				}
 				emitStreamEvent(emit, StreamEvent{
 					Type:          "tool_call_ready",
@@ -314,7 +316,7 @@ func (a *streamAssembler) emit(event StreamEvent) {
 	a.handler(event)
 }
 
-func (a *streamAssembler) finalize() {
+func (a *streamAssembler) finalize() error {
 	indices := make([]int, 0, len(a.blocks))
 	for index := range a.blocks {
 		indices = append(indices, index)
@@ -333,11 +335,11 @@ func (a *streamAssembler) finalize() {
 		case "text":
 			item.Text = block.Text.String()
 		case "tool_use":
-			if block.Input.Len() > 0 {
-				item.Input = json.RawMessage(block.Input.String())
-			} else {
-				item.Input = json.RawMessage(`{}`)
+			input, err := normalizeToolCallArgumentsString(block.Input.String(), block.Name, block.ID)
+			if err != nil {
+				return err
 			}
+			item.Input = input
 		case "thinking":
 			item.Thinking = block.Text.String()
 			item.Signature = block.Signature.String()
@@ -345,4 +347,5 @@ func (a *streamAssembler) finalize() {
 		content = append(content, item)
 	}
 	a.response.Content = content
+	return nil
 }
