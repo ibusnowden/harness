@@ -150,7 +150,7 @@ func renderWormAnim(animFrame, width int) string {
 	for i, pos := range wormPath {
 		r, c := pos[0], pos[1]
 		step := i / wormCellsPerStep
-		phase := ((step - animFrame) % wormAnimTotal + wormAnimTotal) % wormAnimTotal
+		phase := ((step-animFrame)%wormAnimTotal + wormAnimTotal) % wormAnimTotal
 		if !grid[r][c].set || phase < grid[r][c].phase {
 			grid[r][c] = cell{phase: phase, set: true}
 		}

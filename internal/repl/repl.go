@@ -867,7 +867,7 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 	// in the transcript so large pastes never corrupt the layout.
 	prompt := m.expandPastePlaceholders(rawPrompt)
 	m.input.Reset()
-	m.layout() // shrink composer back to 1 line after submit
+	m.layout()          // shrink composer back to 1 line after submit
 	m.pasteBlocks = nil // placeholders consumed; reset for next turn
 	m.startupNote = ""
 	m.appendTranscript("Run Request", rawPrompt, "task")
@@ -1221,9 +1221,10 @@ func (m *model) refreshTranscript() {
 
 // renderHelpContent renders the structured help text with full ascaris color palette.
 // Format expected (from cli.go /help):
-//   ## Section Name        → amber bold section header + rule
-//   /cmd|[args]|Description → gold command, dim args, tan description
-//   (blank lines ignored)
+//
+//	## Section Name        → amber bold section header + rule
+//	/cmd|[args]|Description → gold command, dim args, tan description
+//	(blank lines ignored)
 func (m model) renderHelpContent(content string) string {
 	width := max(40, m.transcript.Width-4)
 	cmdWidth := 20
@@ -1277,7 +1278,9 @@ func (m model) renderHelpContent(content string) string {
 }
 
 // renderCompactOperation renders a tool/operation event as a compact single dim line:
-//   · bash  go test ./...
+//
+//	· bash  go test ./...
+//
 // Full output stays in the activity pane (F2 / Ctrl+O).
 func (m model) renderCompactOperation(item transcriptEntry) string {
 	glyph := activityKindGlyph[item.kind]
@@ -1607,7 +1610,7 @@ func (m model) renderStartupView() string {
 		//   right total = (topH + 2) + (bottomH + 2) = topH + bottomH + 4
 		// For alignment: leftH + 2 = topH + bottomH + 4  →  topH + bottomH = leftH - 2
 		leftH := max(14, m.transcript.Height+2)
-		topH := max(8, (leftH-2+1)/2) // ceiling half, minimum 8
+		topH := max(8, (leftH-2+1)/2)  // ceiling half, minimum 8
 		bottomH := max(6, (leftH-2)/2) // floor half, minimum 6
 		// If minimums pushed the sum over leftH-2, extend leftH to compensate.
 		if topH+bottomH != leftH-2 {
