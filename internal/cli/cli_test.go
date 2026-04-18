@@ -122,8 +122,18 @@ func TestShowAndExecCommandsRun(t *testing.T) {
 }
 
 func TestPromptFlushAndLoadSessionRun(t *testing.T) {
-	root := repoRoot()
+	root := t.TempDir()
 	t.Setenv("ASCARIS_CONFIG_HOME", filepath.Join(t.TempDir(), ".ascaris"))
+	t.Setenv("ANTHROPIC_API_KEY", "")
+	t.Setenv("ANTHROPIC_BASE_URL", "")
+	t.Setenv("GOOGLE_API_KEY", "")
+	t.Setenv("GOOGLE_BASE_URL", "")
+	t.Setenv("OPENAI_API_KEY", "")
+	t.Setenv("OPENAI_BASE_URL", "")
+	t.Setenv("OPENROUTER_API_KEY", "")
+	t.Setenv("OPENROUTER_BASE_URL", "")
+	t.Setenv("XAI_API_KEY", "")
+	t.Setenv("XAI_BASE_URL", "")
 	if code, stdout, stderr := runCLI(t, root, "prompt", "review MCP tool"); code != 0 || !strings.Contains(stdout, "Prompt: review MCP tool") {
 		t.Fatalf("prompt failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
@@ -139,6 +149,39 @@ func TestPromptFlushAndLoadSessionRun(t *testing.T) {
 	code, stdout, stderr = runCLI(t, root, "load-session", sessionID)
 	if code != 0 || !strings.Contains(stdout, sessionID) || !strings.Contains(stdout, "messages") {
 		t.Fatalf("load-session failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestPromptDefaultsDoesNotAutoSelectModelFromAmbientEnv(t *testing.T) {
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+	t.Setenv("GOOGLE_API_KEY", "google-test-key")
+
+	model, provider, permission := promptDefaults(root, globalOptions{})
+	if model != "not configured" {
+		t.Fatalf("unexpected model: %q", model)
+	}
+	if provider != "auto" {
+		t.Fatalf("unexpected provider: %q", provider)
+	}
+	if permission == "" {
+		t.Fatal("expected default permission mode")
+	}
+}
+
+func TestPlanCommandCreatesPlanArtifact(t *testing.T) {
+	root := t.TempDir()
+	code, stdout, stderr := runCLI(t, root, "plan", "add native web search and subagent planning")
+	if code != 0 {
+		t.Fatalf("plan failed: code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "# Implementation Plan") || !strings.Contains(stdout, "Task Contracts") {
+		t.Fatalf("unexpected plan output: %q", stdout)
+	}
+	matches, err := filepath.Glob(filepath.Join(root, ".ascaris", "plans", "plan_*.json"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("expected one plan artifact, matches=%v err=%v", matches, err)
 	}
 }
 

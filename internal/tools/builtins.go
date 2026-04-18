@@ -2,16 +2,23 @@ package tools
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
+	"time"
 
 	"ascaris/internal/api"
+	controlstate "ascaris/internal/state"
+	"ascaris/internal/subagents"
 	"ascaris/internal/tasks"
 )
 
@@ -42,10 +49,12 @@ type LiveResult struct {
 
 type LiveContext struct {
 	Root            string
+	Context         context.Context
 	PermissionMode  PermissionMode
 	AllowedToolName map[string]struct{}
 	Prompter        ApprovalPrompter
 	Activity        func(LiveToolEvent)
+	DelegateTask    func(context.Context, subagents.Assignment) (subagents.Assignment, error)
 }
 
 type LiveToolEvent struct {
@@ -64,11 +73,14 @@ func LiveDefinitions(allowedTools []string) []api.ToolDefinition {
 		toolDefinition("edit_file", "Replace a substring inside a workspace file", `{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"],"additionalProperties":false}`),
 		toolDefinition("glob_search", "Expand a glob pattern inside the current workspace", `{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"],"additionalProperties":false}`),
 		toolDefinition("grep_search", "Search file contents for a pattern", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"output_mode":{"type":"string"}},"required":["pattern","path"],"additionalProperties":false}`),
+		toolDefinition("web_search", "Search the web when ASCARIS_ENABLE_WEB=1", `{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}`),
+		toolDefinition("web_fetch", "Fetch a web page when ASCARIS_ENABLE_WEB=1", `{"type":"object","properties":{"url":{"type":"string"},"max_bytes":{"type":"integer"}},"required":["url"],"additionalProperties":false}`),
 		toolDefinition("bash", "Execute a shell command", `{"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["command"],"additionalProperties":false}`),
 		toolDefinition("task_create", "Create a task in the workspace task list", `{"type":"object","properties":{"title":{"type":"string"},"blocked_by":{"type":"array","items":{"type":"integer"}}},"required":["title"],"additionalProperties":false}`),
 		toolDefinition("task_update", "Update the status of a task (open, in_progress, done, cancelled)", `{"type":"object","properties":{"id":{"type":"integer"},"status":{"type":"string"}},"required":["id","status"],"additionalProperties":false}`),
 		toolDefinition("task_list", "List all tasks in the workspace task list", `{"type":"object","properties":{},"additionalProperties":false}`),
 		toolDefinition("request_plan_approval", "Show the task list to the user and request approval before implementing. Call this after creating all tasks.", `{"type":"object","properties":{"summary":{"type":"string"}},"required":["summary"],"additionalProperties":false}`),
+		toolDefinition("delegate_task", "Create a scoped subagent assignment and worker lane. Returns pending assignment state for an external runner.", `{"type":"object","properties":{"role":{"type":"string"},"prompt":{"type":"string"},"context":{"type":"string"},"allowed_tools":{"type":"array","items":{"type":"string"}},"acceptance_criteria":{"type":"array","items":{"type":"string"}}},"required":["prompt"],"additionalProperties":false}`),
 	}
 	definitions = append(definitions, controlPlaneDefinitions()...)
 	if len(allowed) == 0 {
@@ -105,6 +117,10 @@ func ExecuteLive(ctx LiveContext, call LiveCall) LiveResult {
 		return executeGlobSearch(ctx, call)
 	case "grep_search":
 		return executeGrepSearch(ctx, call)
+	case "web_search":
+		return executeWebSearch(ctx, call)
+	case "web_fetch":
+		return executeWebFetch(ctx, call)
 	case "bash":
 		return executeBash(ctx, call)
 	case "task_create":
@@ -115,6 +131,8 @@ func ExecuteLive(ctx LiveContext, call LiveCall) LiveResult {
 		return executeTaskList(ctx, call)
 	case "request_plan_approval":
 		return executeRequestPlanApproval(ctx, call)
+	case "delegate_task":
+		return executeDelegateTask(ctx, call)
 	default:
 		if result, ok := executeControlPlaneTool(ctx, call); ok {
 			return result
@@ -217,7 +235,7 @@ type fileDiff struct {
 	Before     []string `json:"before"` // context lines preceding the change
 	Removed    []string `json:"removed"`
 	Added      []string `json:"added"`
-	After      []string `json:"after"` // context lines following the change
+	After      []string `json:"after"`      // context lines following the change
 	StartLine  int      `json:"start_line"` // 1-indexed line where removed block begins
 }
 
@@ -397,6 +415,108 @@ func executeGrepSearch(ctx LiveContext, call LiveCall) LiveResult {
 		result["matches"] = re.FindAllString(string(data), -1)
 	}
 	return liveJSON(call, result)
+}
+
+func executeWebSearch(ctx LiveContext, call LiveCall) LiveResult {
+	if strings.TrimSpace(os.Getenv("ASCARIS_ENABLE_WEB")) != "1" {
+		return liveError(call, "web_search is disabled; set ASCARIS_ENABLE_WEB=1 to enable native web access")
+	}
+	var input struct {
+		Query string `json:"query"`
+		Limit int    `json:"limit"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid web_search input: "+err.Error())
+	}
+	query := strings.TrimSpace(input.Query)
+	if query == "" {
+		return liveError(call, "web_search query is required")
+	}
+	limit := input.Limit
+	if limit <= 0 || limit > 10 {
+		limit = 5
+	}
+	body, err := fetchURL("https://duckduckgo.com/html/?q="+url.QueryEscape(query), 256*1024)
+	if err != nil {
+		return liveError(call, "web_search: "+err.Error())
+	}
+	return liveJSON(call, map[string]any{
+		"query":   query,
+		"results": extractSearchResults(string(body), limit),
+	})
+}
+
+func executeWebFetch(ctx LiveContext, call LiveCall) LiveResult {
+	if strings.TrimSpace(os.Getenv("ASCARIS_ENABLE_WEB")) != "1" {
+		return liveError(call, "web_fetch is disabled; set ASCARIS_ENABLE_WEB=1 to enable native web access")
+	}
+	var input struct {
+		URL      string `json:"url"`
+		MaxBytes int    `json:"max_bytes"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid web_fetch input: "+err.Error())
+	}
+	maxBytes := input.MaxBytes
+	if maxBytes <= 0 || maxBytes > 512*1024 {
+		maxBytes = 256 * 1024
+	}
+	body, err := fetchURL(input.URL, maxBytes)
+	if err != nil {
+		return liveError(call, "web_fetch: "+err.Error())
+	}
+	return liveJSON(call, map[string]any{
+		"url":  strings.TrimSpace(input.URL),
+		"text": strings.TrimSpace(stripHTML(string(body))),
+	})
+}
+
+func fetchURL(raw string, maxBytes int) ([]byte, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return nil, err
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return nil, fmt.Errorf("unsupported URL scheme: %s", parsed.Scheme)
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	req, err := http.NewRequest(http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("user-agent", "ascaris-web-tool/0.1")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %s", resp.Status)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, int64(maxBytes)))
+}
+
+func extractSearchResults(html string, limit int) []map[string]string {
+	re := regexp.MustCompile(`(?s)<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>`)
+	matches := re.FindAllStringSubmatch(html, limit)
+	results := make([]map[string]string, 0, len(matches))
+	for _, match := range matches {
+		results = append(results, map[string]string{
+			"title": strings.TrimSpace(stripHTML(match[2])),
+			"url":   htmlUnescape(match[1]),
+		})
+	}
+	return results
+}
+
+func stripHTML(value string) string {
+	re := regexp.MustCompile(`<[^>]+>`)
+	return strings.Join(strings.Fields(htmlUnescape(re.ReplaceAllString(value, " "))), " ")
+}
+
+func htmlUnescape(value string) string {
+	replacer := strings.NewReplacer("&amp;", "&", "&lt;", "<", "&gt;", ">", "&quot;", `"`, "&#39;", "'")
+	return replacer.Replace(value)
 }
 
 var bashCriticalPatterns = []string{"rm -rf /", "dd if=", ":(){:|:&};:", "mkfs", "shutdown", "reboot"}
@@ -700,4 +820,76 @@ func executeRequestPlanApproval(ctx LiveContext, call LiveCall) LiveResult {
 		Name:      call.Name,
 		Output:    `{"approved":true,"message":"Plan approved. Begin executing all tasks now following the Agentic Task Execution protocol. Start with task #1."}`,
 	}
+}
+
+func executeDelegateTask(ctx LiveContext, call LiveCall) LiveResult {
+	var input struct {
+		Role               string   `json:"role"`
+		Prompt             string   `json:"prompt"`
+		Context            string   `json:"context"`
+		AllowedTools       []string `json:"allowed_tools"`
+		AcceptanceCriteria []string `json:"acceptance_criteria"`
+	}
+	if err := json.Unmarshal(call.Input, &input); err != nil {
+		return liveError(call, "invalid delegate_task input: "+err.Error())
+	}
+	if strings.TrimSpace(input.Prompt) == "" {
+		return liveError(call, "delegate_task prompt is required")
+	}
+	workerRegistry, err := controlstate.LoadWorkerRegistry(ctx.Root)
+	if err != nil {
+		return liveError(call, err.Error())
+	}
+	worker := workerRegistry.Create(ctx.Root, []string{ctx.Root}, true)
+	if _, err := workerRegistry.Observe(worker.WorkerID, "Ascaris> ready for prompt"); err != nil {
+		return liveError(call, err.Error())
+	}
+	worker, err = workerRegistry.SendPrompt(worker.WorkerID, input.Prompt)
+	if err != nil {
+		return liveError(call, err.Error())
+	}
+	if err := controlstate.SaveWorkerRegistry(ctx.Root, workerRegistry); err != nil {
+		return liveError(call, err.Error())
+	}
+	subagentRegistry, err := subagents.LoadRegistry(ctx.Root)
+	if err != nil {
+		return liveError(call, err.Error())
+	}
+	assignment, err := subagentRegistry.Create(worker.WorkerID, input.Role, input.Prompt, input.Context, input.AllowedTools, input.AcceptanceCriteria)
+	if err != nil {
+		return liveError(call, err.Error())
+	}
+	if err := subagents.SaveRegistry(ctx.Root, subagentRegistry); err != nil {
+		return liveError(call, err.Error())
+	}
+	if ctx.DelegateTask != nil {
+		runCtx := ctx.Context
+		if runCtx == nil {
+			runCtx = context.Background()
+		}
+		assignment, err = ctx.DelegateTask(runCtx, assignment)
+		if err != nil {
+			return liveError(call, err.Error())
+		}
+	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "subagent",
+		Title:   assignment.AssignmentID,
+		Summary: "Delegated task to " + assignment.Role + ".",
+		Detail:  assignment.Prompt,
+	})
+	return liveJSON(call, map[string]any{
+		"assignment_id":       assignment.AssignmentID,
+		"worker_id":           assignment.WorkerID,
+		"role":                assignment.Role,
+		"status":              assignment.Status,
+		"prompt":              assignment.Prompt,
+		"allowed_tools":       assignment.AllowedTools,
+		"acceptance_criteria": assignment.AcceptanceCriteria,
+		"result_summary":      assignment.ResultSummary,
+		"error":               assignment.Error,
+		"verification":        assignment.Verification,
+		"worker_status":       worker.Status,
+		"message":             "subagent assignment recorded",
+	})
 }

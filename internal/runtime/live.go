@@ -133,6 +133,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 	}
 	providerCfg := api.ProviderConfig{
 		AnthropicBaseURL:  h.Config.ProviderSettings().AnthropicBaseURL,
+		GoogleBaseURL:     h.Config.ProviderSettings().GoogleBaseURL,
 		OpenAIBaseURL:     h.Config.ProviderSettings().OpenAIBaseURL,
 		OpenRouterBaseURL: h.Config.ProviderSettings().OpenRouterBaseURL,
 		PreferredProvider: opts.Provider,
@@ -141,13 +142,16 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 		ConfigHome:        config.ConfigHome(h.Root),
 		OAuthSettings:     h.Config.OAuth(),
 	}
-	client, err := api.NewProviderClient(resolveModel(opts.Model), providerCfg)
+	resolvedModel := resolveModel(opts.Model)
+	route, err := api.ResolveModelRoute(resolvedModel, providerCfg)
 	if err != nil {
-		return PromptSummary{}, fmt.Errorf("%w\n\nSet a provider API key: OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY, or XAI_API_KEY", err)
+		return PromptSummary{}, fmt.Errorf("%w\n\nSet a provider API key: ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or XAI_API_KEY", err)
 	}
-	// Compute the model name as the chosen provider expects it (e.g. OpenRouter
-	// requires "anthropic/claude-sonnet-4-6" rather than "claude-sonnet-4-6").
-	requestModel := resolvedModelForClient(resolveModel(opts.Model), client)
+	client, err := api.NewProviderClient(resolvedModel, providerCfg)
+	if err != nil {
+		return PromptSummary{}, fmt.Errorf("%w\n\nSet a provider API key: ANTHROPIC_API_KEY, GOOGLE_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY, or XAI_API_KEY", err)
+	}
+	requestModel := route.RequestModel
 	cache := promptcache.New(h.Root, session.Meta.SessionID)
 	autoCompaction := applyAutoCompaction(&session, effectiveAutoCompactThreshold(opts))
 	session.RecordPrompt(prompt)
@@ -162,7 +166,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 	summary := PromptSummary{
 		Model:             opts.Model,
 		RequestModel:      requestModel,
-		Provider:          string(client.ProviderKind()),
+		Provider:          string(route.Provider),
 		TurnID:            promptTurnID,
 		AutoCompaction:    autoCompaction,
 		ToolUses:          []ToolUseRecord{},
@@ -645,8 +649,7 @@ func defaultSystemPrompt() string {
 
 // resolveModel expands short aliases to their full model names.
 // An empty string is returned as-is — callers must validate before use.
-// Short Claude aliases (sonnet/opus/haiku) still work and will be routed
-// through OpenRouter as anthropic/claude-* when ANTHROPIC_API_KEY is absent.
+// Provider routing happens later in api.ResolveModelRoute.
 func resolveModel(model string) string {
 	switch strings.ToLower(strings.TrimSpace(model)) {
 	case "sonnet":
@@ -658,22 +661,6 @@ func resolveModel(model string) string {
 	default:
 		return strings.TrimSpace(model)
 	}
-}
-
-// resolvedModelForClient maps a canonical model name to the format expected
-// by the given client. OpenRouter requires provider-prefixed slugs such as
-// "anthropic/claude-sonnet-4-6"; all other clients use the name as-is.
-func resolvedModelForClient(model string, client api.MessageClient) string {
-	if client.ProviderKind() != api.ProviderOpenRouter {
-		return model
-	}
-	if strings.Contains(model, "/") {
-		return model // already prefixed, e.g. "openai/gpt-4o"
-	}
-	if strings.HasPrefix(model, "claude-") {
-		return "anthropic/" + model
-	}
-	return model
 }
 
 func estimateCost(usage api.Usage, model string) float64 {

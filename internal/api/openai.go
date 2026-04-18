@@ -25,6 +25,10 @@ func (c *OpenAICompatClient) ProviderKind() ProviderKind {
 }
 
 func (c *OpenAICompatClient) StreamMessage(ctx context.Context, request MessageRequest) (MessageResponse, error) {
+	return c.StreamMessageEvents(ctx, request, nil)
+}
+
+func (c *OpenAICompatClient) StreamMessageEvents(ctx context.Context, request MessageRequest, emit func(StreamEvent)) (MessageResponse, error) {
 	payload, err := json.Marshal(toOpenAIRequest(request))
 	if err != nil {
 		return MessageResponse{}, err
@@ -42,9 +46,16 @@ func (c *OpenAICompatClient) StreamMessage(ctx context.Context, request MessageR
 	defer response.Body.Close()
 	if response.StatusCode >= 300 {
 		payload, _ := io.ReadAll(response.Body)
-		return MessageResponse{}, fmt.Errorf("openai-compatible request failed: %s: %s", response.Status, strings.TrimSpace(string(payload)))
+		msg := strings.TrimSpace(string(payload))
+		if response.StatusCode == 404 && c.kind == ProviderOpenRouter {
+			return MessageResponse{}, fmt.Errorf(
+				"model not found on OpenRouter: %s\n\nCheck available models at https://openrouter.ai/models\nUpdate the model in .ascaris/settings.json then restart.",
+				msg,
+			)
+		}
+		return MessageResponse{}, fmt.Errorf("openai-compatible request failed: %s: %s", response.Status, msg)
 	}
-	return parseOpenAIStream(response.Body)
+	return parseOpenAIStream(response.Body, emit)
 }
 
 func normalizeChatCompletionsURL(baseURL string) string {
@@ -157,7 +168,7 @@ func convertOpenAIMessages(message InputMessage) []map[string]any {
 	return []map[string]any{out}
 }
 
-func parseOpenAIStream(body io.Reader) (MessageResponse, error) {
+func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse, error) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
 	type toolCall struct {
@@ -222,6 +233,10 @@ func parseOpenAIStream(body io.Reader) (MessageResponse, error) {
 		for _, choice := range chunk.Choices {
 			if choice.Delta.Content != "" {
 				text.WriteString(choice.Delta.Content)
+				emitStreamEvent(emit, StreamEvent{
+					Type: "text_delta",
+					Text: choice.Delta.Content,
+				})
 			}
 			for _, item := range choice.Delta.ToolCalls {
 				call := toolCalls[item.Index]
@@ -238,6 +253,13 @@ func parseOpenAIStream(body io.Reader) (MessageResponse, error) {
 				if item.Function.Arguments != "" {
 					call.Arguments.WriteString(item.Function.Arguments)
 				}
+				emitStreamEvent(emit, StreamEvent{
+					Type:           "tool_call_delta",
+					ToolCallID:     call.ID,
+					ToolCallIndex:  item.Index,
+					ToolName:       call.Name,
+					ToolInputDelta: item.Function.Arguments,
+				})
 			}
 			if choice.FinishReason != "" {
 				stopReason = choice.FinishReason
@@ -258,11 +280,19 @@ func parseOpenAIStream(body io.Reader) (MessageResponse, error) {
 	sort.Ints(indices)
 	for _, index := range indices {
 		call := toolCalls[index]
+		input := json.RawMessage(compactJSONString(call.Arguments.String()))
 		content = append(content, OutputContentBlock{
 			Type:  "tool_use",
 			ID:    call.ID,
 			Name:  call.Name,
-			Input: json.RawMessage(compactJSONString(call.Arguments.String())),
+			Input: input,
+		})
+		emitStreamEvent(emit, StreamEvent{
+			Type:          "tool_call_ready",
+			ToolCallID:    call.ID,
+			ToolCallIndex: index,
+			ToolName:      call.Name,
+			ToolInput:     input,
 		})
 	}
 	if response.Model == "" {
@@ -270,7 +300,19 @@ func parseOpenAIStream(body io.Reader) (MessageResponse, error) {
 	}
 	response.Content = content
 	response.StopReason = mapOpenAIFinishReason(stopReason)
+	emitStreamEvent(emit, StreamEvent{
+		Type:       "message_stop",
+		StopReason: response.StopReason,
+		Usage:      response.Usage,
+	})
 	return response, nil
+}
+
+func emitStreamEvent(emit func(StreamEvent), event StreamEvent) {
+	if emit == nil {
+		return
+	}
+	emit(event)
 }
 
 func rawJSONOrEmptyObject(raw json.RawMessage) any {

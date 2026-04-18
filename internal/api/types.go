@@ -15,6 +15,20 @@ type MessageRequest struct {
 	Stream     bool             `json:"stream,omitempty"`
 }
 
+type StreamEvent struct {
+	Type           string          `json:"type"`
+	Text           string          `json:"text,omitempty"`
+	ToolCallID     string          `json:"tool_call_id,omitempty"`
+	ToolCallIndex  int             `json:"tool_call_index,omitempty"`
+	ToolName       string          `json:"tool_name,omitempty"`
+	ToolInput      json.RawMessage `json:"tool_input,omitempty"`
+	ToolInputDelta string          `json:"tool_input_delta,omitempty"`
+	Thinking       string          `json:"thinking,omitempty"`
+	Signature      string          `json:"signature,omitempty"`
+	Usage          Usage           `json:"usage,omitempty"`
+	StopReason     string          `json:"stop_reason,omitempty"`
+}
+
 type ToolChoice struct {
 	Type string `json:"type"`
 	Name string `json:"name,omitempty"`

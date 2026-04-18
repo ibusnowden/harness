@@ -33,6 +33,7 @@ import (
 	"ascaris/internal/outputstyles"
 	"ascaris/internal/parity"
 	"ascaris/internal/permissions"
+	"ascaris/internal/planning"
 	"ascaris/internal/plugins"
 	"ascaris/internal/pool"
 	"ascaris/internal/query"
@@ -196,6 +197,8 @@ func Run(ctx Context, args []string, stdin io.Reader, stdout, stderr io.Writer) 
 		return runDoctor(ctx, remaining[1:], stdout, stderr)
 	case "review":
 		return runSecurityWorkflow(ctx, securityreview.ModeReview, securityreview.WorkflowSource, remaining[1:], stdout, stderr)
+	case "plan":
+		return runPlanCommand(ctx, remaining[1:], stdout, stderr)
 	case "security-review":
 		return runSecurityWorkflow(ctx, securityreview.ModeSecurityReview, securityreview.WorkflowAuto, remaining[1:], stdout, stderr)
 	case "bughunter":
@@ -384,6 +387,30 @@ func runSecurityWorkflow(ctx Context, mode securityreview.Mode, defaultWorkflow 
 		return fail(stderr, err)
 	}
 	_, _ = fmt.Fprintln(stdout, report.Render(securityreview.OutputFormat(strings.ToLower(strings.TrimSpace(*formatValue)))))
+	return 0
+}
+
+func runPlanCommand(ctx Context, args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("plan", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOut := fs.Bool("json", false, "")
+	if err := fs.Parse(args); err != nil {
+		return fail(stderr, err)
+	}
+	request := strings.TrimSpace(strings.Join(fs.Args(), " "))
+	if request == "" {
+		return fail(stderr, fmt.Errorf("plan requires a task description"))
+	}
+	plan, err := planning.Create(ctx.Root, planning.Options{Request: request})
+	if err != nil {
+		return fail(stderr, err)
+	}
+	if *jsonOut {
+		data, _ := json.MarshalIndent(plan, "", "  ")
+		_, _ = fmt.Fprintln(stdout, string(data))
+		return 0
+	}
+	_, _ = fmt.Fprintln(stdout, planning.RenderMarkdown(plan))
 	return 0
 }
 
@@ -884,8 +911,7 @@ func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashRe
 		switch args[0] {
 		case "/model":
 			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
-				current := fallbackString(options.Model, "default")
-				return repl.SlashResult{Output: fmt.Sprintf("Usage: /model <model-name>\nCurrent model: %s", current)}
+				return repl.SlashResult{Output: renderModelList(options.Model, options.Provider)}
 			}
 			newModel := strings.TrimSpace(args[1])
 			_, providerLabel, _ := promptDefaults(ctx.Root, globalOptions{
@@ -908,8 +934,7 @@ func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashRe
 			}
 		case "/provider":
 			if len(args) < 2 || strings.TrimSpace(args[1]) == "" {
-				current := fallbackString(displayProvider(options.Provider), "auto")
-				return repl.SlashResult{Output: fmt.Sprintf("Usage: /provider <provider-name>\nCurrent provider: %s", current)}
+				return repl.SlashResult{Output: renderProviderList(options.Provider)}
 			}
 			newProvider := strings.TrimSpace(args[1])
 			effectiveProvider := newProvider
@@ -930,25 +955,12 @@ func runSlashInTUI(ctx Context, options globalOptions, line string) repl.SlashRe
 			if taskDesc == "" {
 				taskDesc = "the task described in this conversation"
 			}
-			prompt := "You are planning work for this workspace. Follow these steps exactly:\n\n" +
-				"## Step 1 — Read the workspace\n" +
-				"Run these bash commands:\n" +
-				"  git ls-files | head -60\n" +
-				"  git status --short\n\n" +
-				"## Step 2 — Create tasks\n" +
-				"Use the task_create tool to break this into concrete, actionable subtasks:\n\n  " + taskDesc + "\n\n" +
-				"Rules:\n" +
-				"- Each task is one actionable unit of work\n" +
-				"- Set blocked_by to IDs of prerequisite tasks\n" +
-				"- Keep titles under 72 chars\n\n" +
-				"## Step 3 — Request approval\n" +
-				"After ALL tasks are created, call request_plan_approval(summary) with a one-sentence\n" +
-				"summary of the plan. The harness will show the task list to the user and ask Y/N.\n" +
-				"Do NOT write 'type /proceed' or ask in text — the tool handles the approval prompt.\n" +
-				"Do NOT start implementing until request_plan_approval returns {approved: true}."
+			plan, err := planning.Create(ctx.Root, planning.Options{Request: taskDesc})
+			if err != nil {
+				return repl.SlashResult{Output: err.Error(), Error: true}
+			}
 			return repl.SlashResult{
-				Output:    "Reading workspace and building task list…",
-				RunPrompt: prompt,
+				Output: planning.RenderMarkdown(plan),
 			}
 		case "/memory":
 			return runMemorySlashResult(ctx, args[1:])
@@ -1010,7 +1022,7 @@ func runLivePrompt(harness livePromptHarness, root, prompt string, options globa
 }
 
 func promptDefaults(root string, options globalOptions) (string, string, string) {
-	modelLabel := "not configured"
+	modelLabel := ""
 	providerLabel := "auto"
 	permissionLabel := string(hruntime.DefaultPromptOptions().PermissionMode)
 	runtimeConfig, err := config.Load(root)
@@ -1034,18 +1046,24 @@ func promptDefaults(root string, options globalOptions) (string, string, string)
 	if value := strings.TrimSpace(string(options.PermissionMode)); value != "" {
 		permissionLabel = value
 	}
+	if modelLabel == "" {
+		modelLabel = "not configured"
+	}
 	// If provider is still "auto", resolve what will actually be used given the
 	// current environment so the header shows e.g. "openrouter" not "auto".
 	if providerLabel == "auto" || providerLabel == "" {
 		settings := runtimeConfig.ProviderSettings()
-		detected := api.AutoDetectProvider(modelLabel, api.ProviderConfig{
+		route, err := api.ResolveModelRoute(modelLabel, api.ProviderConfig{
 			AnthropicBaseURL:  settings.AnthropicBaseURL,
+			GoogleBaseURL:     settings.GoogleBaseURL,
 			OpenAIBaseURL:     settings.OpenAIBaseURL,
 			OpenRouterBaseURL: settings.OpenRouterBaseURL,
 			XAIBaseURL:        settings.XAIBaseURL,
 			ProxyURL:          settings.ProxyURL,
 		})
-		providerLabel = string(detected)
+		if err == nil && route.Provider != "" {
+			providerLabel = string(route.Provider)
+		}
 	}
 	return modelLabel, providerLabel, permissionLabel
 }
@@ -1101,6 +1119,107 @@ func displayProvider(provider api.ProviderKind) string {
 		return "auto"
 	}
 	return string(provider)
+}
+
+// modelsByProvider lists curated recommended models for each provider.
+var modelsByProvider = map[string][]struct{ name, note string }{
+	"anthropic": {
+		{"claude-opus-4-7", "most capable"},
+		{"claude-sonnet-4-6", "recommended ←"},
+		{"claude-haiku-4-5", "fastest"},
+	},
+	"google": {
+		{"gemini-2.0-flash", "recommended ←"},
+		{"gemini-2.0-flash-lite", "fastest"},
+		{"gemini-1.5-pro", ""},
+		{"gemini-1.5-flash", ""},
+	},
+	"openai": {
+		{"gpt-4o", "recommended ←"},
+		{"gpt-4o-mini", "fastest"},
+		{"o3", "reasoning"},
+		{"o4-mini", "fast reasoning"},
+	},
+	"openrouter": {
+		{"anthropic/claude-opus-4-7", "most capable"},
+		{"anthropic/claude-sonnet-4-6", "recommended ←"},
+		{"openai/gpt-4o", ""},
+		{"google/gemini-2.0-flash", ""},
+		{"x-ai/grok-3", ""},
+		{"x-ai/grok-3-mini", ""},
+		{"meta-llama/llama-4-maverick", ""},
+		{"qwen/qwen3-235b-a22b", ""},
+	},
+	"xai": {
+		{"grok-3", "recommended ←"},
+		{"grok-3-mini", "fastest"},
+	},
+}
+
+func renderModelList(currentModel string, currentProvider api.ProviderKind) string {
+	providerKey := strings.ToLower(string(currentProvider))
+	if providerKey == "" {
+		providerKey = "auto"
+	}
+	providerLabel := providerKey
+	if providerLabel == "" {
+		providerLabel = "auto"
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Current model:    %s\n", fallbackString(currentModel, "not set")))
+	sb.WriteString(fmt.Sprintf("Current provider: %s\n", providerLabel))
+
+	if models, ok := modelsByProvider[providerKey]; ok {
+		sb.WriteString(fmt.Sprintf("\nAvailable models (%s):\n", providerLabel))
+		for _, m := range models {
+			if m.note != "" {
+				sb.WriteString(fmt.Sprintf("  %-42s %s\n", m.name, m.note))
+			} else {
+				sb.WriteString("  " + m.name + "\n")
+			}
+		}
+	} else {
+		sb.WriteString("\nAvailable models by provider — use /provider to switch:\n")
+		for provider, models := range modelsByProvider {
+			sb.WriteString(fmt.Sprintf("\n  %s:\n", provider))
+			for _, m := range models {
+				sb.WriteString("    " + m.name + "\n")
+			}
+		}
+	}
+
+	sb.WriteString("\nUsage: /model <model-name>\n")
+	sb.WriteString("       /model <provider/model-name>   to switch via OpenRouter\n")
+	sb.WriteString("Example: /model gemini-2.0-flash\n")
+	sb.WriteString("See /provider to switch providers")
+	return sb.String()
+}
+
+func renderProviderList(currentProvider api.ProviderKind) string {
+	current := fallbackString(string(currentProvider), "auto")
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Current provider: %s\n", current))
+	sb.WriteString("\nAvailable providers:\n")
+	providers := []struct{ name, desc string }{
+		{"anthropic", "Direct Anthropic API  (ANTHROPIC_API_KEY)"},
+		{"google", "Google Gemini API     (GOOGLE_API_KEY)"},
+		{"openai", "OpenAI-compatible API (OPENAI_API_KEY)"},
+		{"openrouter", "OpenRouter gateway    (OPENROUTER_API_KEY) — access all models"},
+		{"xai", "xAI Grok API          (XAI_API_KEY)"},
+		{"auto", "Auto-detect from credentials"},
+	}
+	for _, p := range providers {
+		marker := "  "
+		if p.name == current {
+			marker = "→ "
+		}
+		sb.WriteString(fmt.Sprintf("%s%-12s %s\n", marker, p.name, p.desc))
+	}
+	sb.WriteString("\nUsage: /provider <name>\n")
+	sb.WriteString("Example: /provider google\n")
+	sb.WriteString("See /model for available models per provider")
+	return sb.String()
 }
 
 func promptSpinnerLabel(phase hruntime.PromptPhase) string {

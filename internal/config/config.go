@@ -28,6 +28,7 @@ type RuntimeConfig struct {
 
 type ProviderSettings struct {
 	AnthropicBaseURL  string
+	GoogleBaseURL     string
 	OpenAIBaseURL     string
 	OpenRouterBaseURL string
 	Kind              string
@@ -132,6 +133,10 @@ func (c RuntimeConfig) ProviderSettings() ProviderSettings {
 		AnthropicBaseURL: firstNonEmpty(
 			stringAtMap(provider, "anthropicBaseURL"),
 			stringAtMap(provider, "anthropic_base_url"),
+		),
+		GoogleBaseURL: firstNonEmpty(
+			stringAtMap(provider, "googleBaseURL"),
+			stringAtMap(provider, "google_base_url"),
 		),
 		OpenAIBaseURL: firstNonEmpty(
 			stringAtMap(provider, "openaiBaseURL"),

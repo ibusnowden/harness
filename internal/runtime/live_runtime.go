@@ -155,10 +155,10 @@ func (r *liveRuntime) ExecuteTool(ctx context.Context, call tools.LiveCall) tool
 	return result
 }
 
-func (r *liveRuntime) StreamMessage(ctx context.Context, client api.MessageClient, request api.MessageRequest) (api.MessageResponse, error) {
+func (r *liveRuntime) StreamMessage(ctx context.Context, client api.MessageClient, request api.MessageRequest, emit func(api.StreamEvent)) (api.MessageResponse, error) {
 	attemptedRecovery := false
 	for {
-		response, err := client.StreamMessage(ctx, request)
+		response, err := client.StreamMessageEvents(ctx, request, emit)
 		if err != nil {
 			if attemptedRecovery {
 				return api.MessageResponse{}, err
@@ -270,12 +270,21 @@ func (r *liveRuntime) executeRecoveryStep(ctx context.Context, scenario recovery
 	}
 }
 
-func (r *liveRuntime) executeByKind(_ context.Context, call tools.LiveCall, permissionMode tools.PermissionMode) tools.LiveResult {
+func (r *liveRuntime) executeByKind(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode) tools.LiveResult {
+	return r.executeByKindWithAllowed(ctx, call, permissionMode, r.options.AllowedTools)
+}
+
+func (r *liveRuntime) executeByKindWithAllowed(ctx context.Context, call tools.LiveCall, permissionMode tools.PermissionMode, allowedTools []string) tools.LiveResult {
 	if builtIn := tools.ExecuteLive(tools.LiveContext{
 		Root:            r.root,
+		Context:         ctx,
 		PermissionMode:  permissionMode,
-		AllowedToolName: toAllowMap(r.options.AllowedTools),
+		AllowedToolName: toAllowMap(allowedTools),
 		Prompter:        r.options.Prompter,
+		Activity: func(event tools.LiveToolEvent) {
+			emitActivity(r.options, activityForToolEvent(event, 0))
+		},
+		DelegateTask: r.runSubagentAssignment,
 	}, call); !strings.HasPrefix(builtIn.Output, "unknown built-in tool:") || !builtIn.IsError {
 		return builtIn
 	}
@@ -283,13 +292,37 @@ func (r *liveRuntime) executeByKind(_ context.Context, call tools.LiveCall, perm
 		if tool.Name != call.Name {
 			continue
 		}
+		if len(allowedTools) > 0 {
+			if _, ok := toAllowMap(allowedTools)[strings.ToLower(tool.Name)]; !ok {
+				continue
+			}
+		}
 		if !permitsPluginPermission(permissionMode, tool.RequiredPermission) {
 			return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: fmt.Sprintf("%s requires %s permission", call.Name, tool.RequiredPermission), IsError: true}
 		}
+		emitActivity(r.options, ActivityEvent{
+			Kind:    "plugin_start",
+			Title:   tool.Name,
+			Summary: "Running plugin tool.",
+			Detail:  compactJSON(call.Input),
+		})
 		output, err := r.pluginManager.ExecuteTool(tool, call.Input)
-		return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: outputOrError(output, err), IsError: err != nil}
+		rendered := outputOrError(output, err)
+		emitActivity(r.options, ActivityEvent{
+			Kind:    "plugin_result",
+			Title:   tool.Name,
+			Summary: "Plugin tool completed.",
+			Detail:  rendered,
+			Error:   err != nil,
+		})
+		return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: rendered, IsError: err != nil}
 	}
 	if strings.HasPrefix(call.Name, "mcp__") {
+		if len(allowedTools) > 0 {
+			if _, ok := toAllowMap(allowedTools)[strings.ToLower(call.Name)]; !ok {
+				return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: fmt.Sprintf("%s is not in the allowed tool list", call.Name), IsError: true}
+			}
+		}
 		if permissionMode == tools.PermissionReadOnly {
 			return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: "MCP tool calls require workspace-write permission", IsError: true}
 		}
@@ -302,7 +335,20 @@ func (r *liveRuntime) executeByKind(_ context.Context, call tools.LiveCall, perm
 				return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: "MCP tool call denied by user approval prompt", IsError: true}
 			}
 		}
+		emitActivity(r.options, ActivityEvent{
+			Kind:    "mcp_start",
+			Title:   call.Name,
+			Summary: "Calling MCP tool.",
+			Detail:  compactJSON(call.Input),
+		})
 		output, err := r.mcpRegistry.CallQualifiedTool(call.Name, call.Input)
+		emitActivity(r.options, ActivityEvent{
+			Kind:    "mcp_result",
+			Title:   call.Name,
+			Summary: "MCP tool completed.",
+			Detail:  output,
+			Error:   err != nil,
+		})
 		return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: outputOrError(output, err), IsError: err != nil}
 	}
 	return tools.LiveResult{ToolUseID: call.ID, Name: call.Name, Output: "unknown tool: " + call.Name, IsError: true}

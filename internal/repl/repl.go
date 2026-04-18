@@ -132,6 +132,7 @@ const (
 
 type spinnerTick time.Time
 type taskPollTick time.Time
+type wormAnimTick time.Time
 
 // slashItem is a single autocomplete entry for the command picker.
 type slashItem struct {
@@ -249,6 +250,7 @@ type model struct {
 	busy         bool
 	approval     *ApprovalRequest
 	spinFrame    int
+	wormFrame    int
 	spinVerb     string
 	cwdShort     string // shortenPath(workspace), cached at init
 	activityHint string
@@ -392,7 +394,11 @@ func applyTextareaTheme(input *textarea.Model) {
 func (m model) Init() tea.Cmd {
 	// Enable bracketed paste so we can detect pasted content and show a compact
 	// placeholder instead of dumping raw text into the input line.
-	return tea.Batch(textarea.Blink, tea.EnableBracketedPaste, taskPollCmd())
+	cmds := []tea.Cmd{textarea.Blink, tea.EnableBracketedPaste, taskPollCmd()}
+	if m.showStartup() {
+		cmds = append(cmds, wormAnimTickCmd())
+	}
+	return tea.Batch(cmds...)
 }
 
 func taskPollCmd() tea.Cmd {
@@ -419,6 +425,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 		return m, taskPollCmd()
+	case wormAnimTick:
+		if !m.showStartup() {
+			return m, nil
+		}
+		m.wormFrame = (m.wormFrame + 1) % wormAnimTotal
+		return m, wormAnimTickCmd()
 	case spinnerTick:
 		if !m.busy {
 			// Turn ended while tick was in flight; don't reschedule.
@@ -851,17 +863,18 @@ func (m model) submitInput() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	rawPrompt := m.input.Value()
-	// Expand paste placeholders back to their full content before submitting.
+	// Expand paste placeholders for the model but keep the compact placeholder
+	// in the transcript so large pastes never corrupt the layout.
 	prompt := m.expandPastePlaceholders(rawPrompt)
 	m.input.Reset()
 	m.layout() // shrink composer back to 1 line after submit
 	m.pasteBlocks = nil // placeholders consumed; reset for next turn
 	m.startupNote = ""
-	m.appendTranscript("Run Request", prompt, "task")
+	m.appendTranscript("Run Request", rawPrompt, "task")
 	m.recordActivity(activityRecord{
 		title:   "Run Request",
-		summary: firstLine(prompt),
-		detail:  strings.TrimSpace(prompt),
+		summary: firstLine(rawPrompt),
+		detail:  strings.TrimSpace(rawPrompt),
 		kind:    "prompt",
 	})
 	m.busy = true
@@ -954,8 +967,13 @@ func (m *model) layout() {
 
 	if m.showActivity {
 		if m.width >= 120 {
-			m.transcript.Width = max(24, ((m.width-6)*2/3)-2)
-			m.activity.Width = max(24, (m.width-6)-m.transcript.Width-3)
+			// Each panel has border(2)+padding(2)=4 chars overhead and there is 1
+			// space between the two panels, so usable viewport width = m.width-11.
+			// Setting viewport widths to the panel inner area (outer-4) prevents
+			// lipgloss from double-wrapping content inside the panel borders.
+			total := m.width - 11
+			m.transcript.Width = max(24, total*2/3)
+			m.activity.Width = max(24, total-m.transcript.Width)
 			m.transcript.Height = mainHeight
 			m.activity.Height = mainHeight
 		} else {
@@ -1491,15 +1509,16 @@ func (m model) renderMainContent() string {
 	if m.showStartup() {
 		return m.renderStartupView()
 	}
-	transcriptPanel := m.panel(m.transcript.View(), m.transcript.Width+2, m.transcript.Height+2, m.focus == focusTranscript)
+	// +4 = border(2) + padding(2) on each side; viewport content fills the inner area exactly.
+	transcriptPanel := m.panel(m.transcript.View(), m.transcript.Width+4, m.transcript.Height+2, m.focus == focusTranscript)
 	if !m.showActivity && !m.showTasks {
 		return transcriptPanel
 	}
 	var rightPanel string
 	if m.showTasks {
-		rightPanel = m.panel(m.renderTaskPanel(), m.activity.Width+2, m.activity.Height+2, false)
+		rightPanel = m.panel(m.renderTaskPanel(), m.activity.Width+4, m.activity.Height+2, false)
 	} else {
-		rightPanel = m.panel(m.activity.View(), m.activity.Width+2, m.activity.Height+2, m.focus == focusActivity)
+		rightPanel = m.panel(m.activity.View(), m.activity.Width+4, m.activity.Height+2, m.focus == focusActivity)
 	}
 	if m.width >= 120 {
 		return lipgloss.JoinHorizontal(lipgloss.Top, transcriptPanel, " ", rightPanel)
@@ -1555,11 +1574,16 @@ func (m model) renderTaskPanel() string {
 }
 
 func (m model) renderWelcome() string {
-	logo := renderLogo(m.transcript.Width, m.theme)
+	w := m.transcript.Width
+	logo := renderLogo(w, m.theme)
 	subtitle := m.theme.Meta().Render("Dispatch a task and watch the harness work, or start with /help.")
 	contextLine := m.theme.Meta().Render(fmt.Sprintf("%s • %s • %s", fallback(m.status.Model, "unknown"), fallback(m.status.Provider, "auto"), fallback(m.status.Permission, "workspace-write")))
-	content := strings.Join([]string{logo, "", contextLine, subtitle}, "\n")
-	return lipgloss.Place(m.transcript.Width, m.transcript.Height, lipgloss.Center, lipgloss.Center, content)
+	parts := []string{logo, ""}
+	if m.transcript.Height >= 30 {
+		parts = append(parts, renderWormAnim(m.wormFrame, w), "")
+	}
+	parts = append(parts, contextLine, subtitle)
+	return lipgloss.Place(w, m.transcript.Height, lipgloss.Center, lipgloss.Center, strings.Join(parts, "\n"))
 }
 
 func (m model) showStartup() bool {
@@ -1590,41 +1614,52 @@ func (m model) renderStartupView() string {
 			leftH = topH + bottomH + 2
 		}
 
-		left := m.panel(m.renderHeroCard(leftWidth-2), leftWidth, leftH, false)
+		left := m.panel(m.renderHeroCard(leftWidth-4), leftWidth, leftH, false)
 		right := lipgloss.JoinVertical(lipgloss.Left,
-			m.panel(m.renderRecentCard(rightWidth-2), rightWidth, topH, false),
-			m.panel(m.renderTipsCard(rightWidth-2), rightWidth, bottomH, false),
+			m.panel(m.renderRecentCard(rightWidth-4), rightWidth, topH, false),
+			m.panel(m.renderTipsCard(rightWidth-4), rightWidth, bottomH, false),
 		)
 		return lipgloss.JoinHorizontal(lipgloss.Top, left, " ", right)
 	}
 	stackWidth := max(18, m.width-2)
 	return lipgloss.JoinVertical(lipgloss.Left,
-		m.panel(m.renderHeroCard(stackWidth-2), stackWidth, max(12, m.transcript.Height/2), false),
-		m.panel(m.renderRecentCard(stackWidth-2), stackWidth, max(6, m.transcript.Height/4), false),
-		m.panel(m.renderTipsCard(stackWidth-2), stackWidth, max(6, m.transcript.Height/4), false),
+		m.panel(m.renderHeroCard(stackWidth-4), stackWidth, max(12, m.transcript.Height/2), false),
+		m.panel(m.renderRecentCard(stackWidth-4), stackWidth, max(6, m.transcript.Height/4), false),
+		m.panel(m.renderTipsCard(stackWidth-4), stackWidth, max(6, m.transcript.Height/4), false),
 	)
 }
 
 func (m model) renderHeroCard(width int) string {
+	center := func(s string) string {
+		return lipgloss.PlaceHorizontal(width, lipgloss.Center, s)
+	}
+
 	logo := renderLogo(width, m.theme)
 	infoLine := fmt.Sprintf("%s  %s  %s",
 		fallback(m.status.Version, ""),
 		fallback(m.status.Model, "unknown"),
 		filepathBase(m.status.Workspace),
 	)
-	lines := []string{
-		logo,
+
+	lines := []string{logo, ""}
+
+	// Show the animated worm art when there is enough vertical room.
+	if m.transcript.Height >= 30 {
+		lines = append(lines, renderWormAnim(m.wormFrame, width), "")
+	}
+
+	lines = append(lines,
+		center(m.theme.Body().Bold(true).Render("Welcome back")),
+		center(m.theme.Meta().Render(strings.TrimSpace(infoLine))),
 		"",
-		lipgloss.PlaceHorizontal(width, lipgloss.Center, m.theme.Body().Bold(true).Render("Welcome back")),
-		lipgloss.PlaceHorizontal(width, lipgloss.Center, m.theme.Meta().Render(strings.TrimSpace(infoLine))),
-		"",
-		lipgloss.PlaceHorizontal(width, lipgloss.Center, m.theme.Meta().Render(fmt.Sprintf("%s • %s • %s",
+		center(m.theme.Meta().Render(fmt.Sprintf("%s • %s • %s",
 			fallback(m.status.Model, "unknown"),
 			fallback(m.status.Provider, "auto"),
 			fallback(m.status.Permission, "workspace-write"),
 		))),
-	}
-	return lipgloss.Place(width, max(10, m.transcript.Height/2), lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
+	)
+
+	return lipgloss.Place(width, max(10, m.transcript.Height), lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
 }
 
 func (m model) renderRecentCard(width int) string {
@@ -1913,6 +1948,12 @@ func waitForRuntimeEvent(events chan tea.Msg) tea.Cmd {
 func spinnerTickCmd() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(t time.Time) tea.Msg {
 		return spinnerTick(t)
+	})
+}
+
+func wormAnimTickCmd() tea.Cmd {
+	return tea.Tick(150*time.Millisecond, func(t time.Time) tea.Msg {
+		return wormAnimTick(t)
 	})
 }
 
