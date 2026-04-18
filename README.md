@@ -51,7 +51,7 @@ Ascaris stores config and runtime state under `.ascaris/` by default. Override t
 
 - [`USAGE.md`](./USAGE.md) — build/install and CLI usage
 - [`docs/prompt-e2e-stress-test.md`](./docs/prompt-e2e-stress-test.md) — prompt-first physical E2E stress-test runbook
-- [`docs/glm-cluster-deployment.md`](./docs/glm-cluster-deployment.md) — local GLM + vLLM + Ascaris deployment checklist
+- [`docs/qwen-vllm-smoke-test.md`](./docs/qwen-vllm-smoke-test.md) — local Qwen + vLLM + Ascaris smoke-test runbook
 - [`PARITY.md`](./PARITY.md) — current Go traceability and contract notes
 - [`ROADMAP.md`](./ROADMAP.md) — current product direction
 - [`PHILOSOPHY.md`](./PHILOSOPHY.md) — product intent and operating model

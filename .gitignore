@@ -17,6 +17,11 @@
 coverage.out
 *.test
 
+# Inference — logs and local endpoint config (may contain keys or model output)
+/inference/logs/
+/inference/.ascaris/
+/inference/.env
+
 # Legacy/local ecosystem artifacts
 __pycache__/
 .omx/

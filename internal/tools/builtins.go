@@ -69,8 +69,8 @@ func LiveDefinitions(allowedTools []string) []api.ToolDefinition {
 	allowed := allowlist(allowedTools)
 	definitions := []api.ToolDefinition{
 		toolDefinition("read_file", "Read a file from the current workspace", `{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`),
-		toolDefinition("write_file", "Write a file inside the current workspace", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}`),
-		toolDefinition("edit_file", "Replace a substring inside a workspace file", `{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"],"additionalProperties":false}`),
+		toolDefinition("write_file", "Create or overwrite a file inside the current workspace. Use this to create new files or fully replace existing ones.", `{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"],"additionalProperties":false}`),
+		toolDefinition("edit_file", "Replace a substring inside an existing workspace file. The file must already exist; use write_file to create new files.", `{"type":"object","properties":{"path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"}},"required":["path","old_string","new_string"],"additionalProperties":false}`),
 		toolDefinition("glob_search", "Expand a glob pattern inside the current workspace", `{"type":"object","properties":{"pattern":{"type":"string"}},"required":["pattern"],"additionalProperties":false}`),
 		toolDefinition("grep_search", "Search file contents for a pattern", `{"type":"object","properties":{"pattern":{"type":"string"},"path":{"type":"string"},"output_mode":{"type":"string"}},"required":["pattern","path"],"additionalProperties":false}`),
 		toolDefinition("web_search", "Search the web when ASCARIS_ENABLE_WEB=1", `{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"],"additionalProperties":false}`),

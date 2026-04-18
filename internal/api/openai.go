@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -100,6 +101,7 @@ func toOpenAIRequest(request MessageRequest) map[string]any {
 			})
 		}
 		payload["tools"] = tools
+		payload["tool_choice"] = "auto"
 	}
 	if request.ToolChoice != nil {
 		switch request.ToolChoice.Type {
@@ -177,6 +179,7 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 		Arguments strings.Builder
 	}
 	text := strings.Builder{}
+	reasoning := strings.Builder{}
 	toolCalls := map[int]*toolCall{}
 	response := MessageResponse{
 		Kind:  "message",
@@ -198,8 +201,10 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 			Model   string `json:"model"`
 			Choices []struct {
 				Delta struct {
-					Content   string `json:"content"`
-					ToolCalls []struct {
+					Content          string `json:"content"`
+					Reasoning        string `json:"reasoning"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
 						Index    int    `json:"index"`
 						ID       string `json:"id"`
 						Function struct {
@@ -231,6 +236,14 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 			}
 		}
 		for _, choice := range chunk.Choices {
+			reasoningDelta := choice.Delta.ReasoningContent
+			if reasoningDelta == "" {
+				reasoningDelta = choice.Delta.Reasoning
+			}
+			if reasoningDelta != "" {
+				reasoning.WriteString(reasoningDelta)
+				emitStreamEvent(emit, StreamEvent{Type: "thinking_delta", Text: reasoningDelta})
+			}
 			if choice.Delta.Content != "" {
 				text.WriteString(choice.Delta.Content)
 				emitStreamEvent(emit, StreamEvent{
@@ -269,7 +282,11 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 	if err := scanner.Err(); err != nil {
 		return MessageResponse{}, err
 	}
-	content := make([]OutputContentBlock, 0, len(toolCalls)+1)
+	extractedTextToolCalls := []parsedTextToolCall(nil)
+	content := make([]OutputContentBlock, 0, len(toolCalls)+2)
+	if reasoning.Len() > 0 {
+		content = append(content, OutputContentBlock{Type: "thinking", Thinking: reasoning.String()})
+	}
 	if text.Len() > 0 {
 		content = append(content, OutputContentBlock{Type: "text", Text: text.String()})
 	}
@@ -295,6 +312,54 @@ func parseOpenAIStream(body io.Reader, emit func(StreamEvent)) (MessageResponse,
 			ToolInput:     input,
 		})
 	}
+	// Fallback: when the model embeds tool calls as <tool_call>…</tool_call> text blocks
+	// (happens when vLLM's tool-call parser is misconfigured), extract them from the
+	// accumulated text and promote them to proper tool_use blocks.
+	if len(toolCalls) == 0 && text.Len() > 0 {
+		extracted, remainingText := extractTextToolCalls(text.String())
+		if len(extracted) > 0 {
+			extractedTextToolCalls = extracted
+			// Rebuild content: keep reasoning, replace text with stripped version, add tool blocks.
+			rebuilt := make([]OutputContentBlock, 0, len(content)+len(extracted))
+			for _, b := range content {
+				if b.Type == "text" {
+					if strings.TrimSpace(remainingText) != "" {
+						rebuilt = append(rebuilt, OutputContentBlock{Type: "text", Text: remainingText})
+					}
+				} else {
+					rebuilt = append(rebuilt, b)
+				}
+			}
+			for i, tc := range extracted {
+				rebuilt = append(rebuilt, OutputContentBlock{
+					Type:  "tool_use",
+					ID:    fmt.Sprintf("fallback-%d", i),
+					Name:  tc.name,
+					Input: json.RawMessage(compactJSONString(tc.arguments)),
+				})
+			}
+			content = rebuilt
+			if stopReason == "" {
+				stopReason = "tool_calls"
+			}
+		}
+	}
+	if stopReason == "tool_calls" {
+		if len(toolCalls) == 0 && len(extractedTextToolCalls) == 0 {
+			return MessageResponse{}, fmt.Errorf("openai-compatible stream ended with tool_calls finish reason but emitted no tool calls")
+		}
+		if len(extractedTextToolCalls) > 0 {
+			for index, call := range extractedTextToolCalls {
+				emitStreamEvent(emit, StreamEvent{
+					Type:          "tool_call_ready",
+					ToolCallIndex: index,
+					ToolCallID:    fmt.Sprintf("fallback-%d", index),
+					ToolName:      call.name,
+					ToolInput:     json.RawMessage(compactJSONString(call.arguments)),
+				})
+			}
+		}
+	}
 	if response.Model == "" {
 		response.Model = requestModelFallbackFromContent(content)
 	}
@@ -313,6 +378,40 @@ func emitStreamEvent(emit func(StreamEvent), event StreamEvent) {
 		return
 	}
 	emit(event)
+}
+
+var toolCallBlockRE = regexp.MustCompile(`(?s)<tool_call>\s*(\{.*?\})\s*</tool_call>`)
+
+type parsedTextToolCall struct {
+	name      string
+	arguments string
+}
+
+func extractTextToolCalls(text string) ([]parsedTextToolCall, string) {
+	matches := toolCallBlockRE.FindAllStringSubmatchIndex(text, -1)
+	if len(matches) == 0 {
+		return nil, text
+	}
+	var calls []parsedTextToolCall
+	for _, m := range matches {
+		raw := text[m[2]:m[3]]
+		var obj struct {
+			Name      string          `json:"name"`
+			Arguments json.RawMessage `json:"arguments"`
+		}
+		if err := json.Unmarshal([]byte(raw), &obj); err != nil || obj.Name == "" {
+			continue
+		}
+		calls = append(calls, parsedTextToolCall{
+			name:      obj.Name,
+			arguments: compactJSONString(string(obj.Arguments)),
+		})
+	}
+	if len(calls) == 0 {
+		return nil, text
+	}
+	remaining := toolCallBlockRE.ReplaceAllString(text, "")
+	return calls, strings.TrimSpace(remaining)
 }
 
 func rawJSONOrEmptyObject(raw json.RawMessage) any {

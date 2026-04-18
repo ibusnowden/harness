@@ -168,9 +168,6 @@ func NewAnthropicClient(ctx context.Context, cfg ProviderConfig) (*Client, error
 	return nil, fmt.Errorf("ANTHROPIC_API_KEY or saved OAuth credentials are required for Anthropic models")
 }
 
-// AutoDetectProvider returns the ProviderKind that would be used for model
-// given the current environment and config, ignoring any explicit preferred
-// provider override. Used to show the real provider label in the TUI header.
 func AutoDetectProvider(model string, cfg ProviderConfig) ProviderKind {
 	cfg.PreferredProvider = ""
 	route, err := ResolveModelRoute(model, cfg)

@@ -6,13 +6,14 @@ import (
 )
 
 type MessageRequest struct {
-	Model      string           `json:"model"`
-	MaxTokens  int              `json:"max_tokens"`
-	Messages   []InputMessage   `json:"messages"`
-	System     string           `json:"system,omitempty"`
-	Tools      []ToolDefinition `json:"tools,omitempty"`
-	ToolChoice *ToolChoice      `json:"tool_choice,omitempty"`
-	Stream     bool             `json:"stream,omitempty"`
+	Model         string            `json:"model"`
+	MaxTokens     int               `json:"max_tokens"`
+	Messages      []InputMessage    `json:"messages"`
+	System        string            `json:"system,omitempty"`
+	Tools         []ToolDefinition  `json:"tools,omitempty"`
+	ToolChoice    *ToolChoice       `json:"tool_choice,omitempty"`
+	Stream        bool              `json:"stream,omitempty"`
+	StreamHandler func(StreamEvent) `json:"-"`
 }
 
 type StreamEvent struct {
@@ -148,3 +149,4 @@ type ToolResultEnvelope struct {
 	Output    string
 	IsError   bool
 }
+
