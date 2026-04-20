@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"ascaris/internal/api"
+	"ascaris/internal/sessions"
 	"ascaris/internal/testutil/mockanthropic"
 	"ascaris/internal/tools"
 )
@@ -366,6 +367,113 @@ func TestContextAwareMaxTokensUsesObservedInputTokensForLaterIterations(t *testi
 	}
 	if got <= 0 {
 		t.Fatalf("expected positive max tokens, got %d", got)
+	}
+}
+
+func TestContextWindowCompactionKeepsValidToolHistory(t *testing.T) {
+	session := sessions.NewManagedSession("session-1", "qwen3.6-30b-a3b")
+	session.Messages = []api.InputMessage{
+		api.UserTextMessage("implement a long plan"),
+		{
+			Role: "assistant",
+			Content: []api.InputContentBlock{{
+				Type:  "tool_use",
+				ID:    "toolu_old",
+				Name:  "read_file",
+				Input: json.RawMessage(`{"path":"old.txt"}`),
+			}},
+		},
+		api.ToolResultMessage([]api.ToolResultEnvelope{{
+			ToolUseID: "toolu_old",
+			Output:    strings.Repeat("old output\n", 8000),
+		}}),
+		{
+			Role: "assistant",
+			Content: []api.InputContentBlock{{
+				Type:  "tool_use",
+				ID:    "toolu_recent",
+				Name:  "grep_search",
+				Input: json.RawMessage(`{"pattern":"TODO","path":"."}`),
+			}},
+		},
+		api.ToolResultMessage([]api.ToolResultEnvelope{{
+			ToolUseID: "toolu_recent",
+			Output:    "recent result",
+		}}),
+	}
+	request := api.MessageRequest{
+		Model:    "qwen3.6-30b-a3b",
+		System:   "system prompt",
+		Messages: append([]api.InputMessage(nil), session.Messages...),
+	}
+
+	compaction := applyContextWindowCompaction(&session, &request, "implement a long plan", 512)
+	if compaction == nil {
+		t.Fatal("expected context window compaction")
+	}
+	if !messageStartsWithText(session.Messages[0], contextCompactionNoticePrefix) {
+		t.Fatalf("expected leading compaction notice, got %#v", session.Messages[0])
+	}
+	if !validToolHistory(session.Messages) {
+		t.Fatalf("compacted messages contain dangling tool results: %#v", session.Messages)
+	}
+	if got := estimateRequestInputTokens(request); got > contextWindowInputBudget(request.Model, 512) {
+		t.Fatalf("compacted request still exceeds budget: got=%d budget=%d", got, contextWindowInputBudget(request.Model, 512))
+	}
+}
+
+func TestContextWindowCompactionCompactsLargeToolInputs(t *testing.T) {
+	largeContent := strings.Repeat("x", 100000)
+	session := sessions.NewManagedSession("session-1", "qwen3.6-30b-a3b")
+	session.Messages = []api.InputMessage{
+		api.UserTextMessage("write a large generated file"),
+		{
+			Role: "assistant",
+			Content: []api.InputContentBlock{{
+				Type: "tool_use",
+				ID:   "toolu_write",
+				Name: "write_file",
+				Input: json.RawMessage(`{"path":"generated.txt","content":"` +
+					largeContent + `"}`),
+			}},
+		},
+		api.ToolResultMessage([]api.ToolResultEnvelope{{
+			ToolUseID: "toolu_write",
+			Output:    `{"path":"generated.txt","bytes_written":100000}`,
+		}}),
+	}
+	request := api.MessageRequest{
+		Model:    "qwen3.6-30b-a3b",
+		System:   "system prompt",
+		Messages: append([]api.InputMessage(nil), session.Messages...),
+	}
+
+	compaction := applyContextWindowCompaction(&session, &request, "write a large generated file", 512)
+	if compaction == nil {
+		t.Fatal("expected context window compaction")
+	}
+	var input struct {
+		Content string `json:"content"`
+	}
+	found := false
+	for _, message := range session.Messages {
+		for _, block := range message.Content {
+			if block.Type == "tool_use" && block.ID == "toolu_write" {
+				found = true
+				if err := json.Unmarshal(block.Input, &input); err != nil {
+					t.Fatalf("compacted tool input is invalid JSON: %v", err)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected retained write_file tool_use")
+	}
+	if len(input.Content) >= len(largeContent) || !strings.Contains(input.Content, "truncated") {
+		t.Fatalf("expected compacted tool input content, got len=%d", len(input.Content))
+	}
+	if !validToolHistory(session.Messages) {
+		t.Fatalf("compacted messages contain dangling tool results: %#v", session.Messages)
 	}
 }
 

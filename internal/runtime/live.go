@@ -208,6 +208,15 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			Stream:        true,
 			StreamHandler: streamState.Handle,
 		}
+		if budgetCompaction := applyContextWindowCompaction(&session, &request, prompt, minContextResponseTokens(opts.MaxTokens)); budgetCompaction != nil {
+			summary.AutoCompaction = mergeAutoCompactions(summary.AutoCompaction, budgetCompaction)
+			emitActivity(opts, ActivityEvent{
+				Kind:      "status",
+				Title:     "Context Compact",
+				Summary:   budgetCompaction.Notice,
+				Iteration: iteration + 1,
+			})
+		}
 		requestMessageCount := len(request.Messages)
 		request.MaxTokens = contextAwareMaxTokens(request, opts.MaxTokens, tokenObservation)
 		response, event, ok := cache.Lookup(request)
@@ -890,6 +899,205 @@ func applyAutoCompaction(session *sessions.ManagedSession, threshold int) *AutoC
 	return &AutoCompaction{
 		RemovedMessages: removed,
 		Notice:          fmt.Sprintf("[auto-compacted: removed %d messages]", removed),
+	}
+}
+
+const (
+	contextCompactionNoticePrefix = "[Ascaris context compaction]"
+	contextCompactionPayloadChars = 4000
+)
+
+func applyContextWindowCompaction(session *sessions.ManagedSession, request *api.MessageRequest, activePrompt string, minResponseTokens int) *AutoCompaction {
+	if session == nil || request == nil || len(session.Messages) <= 1 {
+		return nil
+	}
+	budget := contextWindowInputBudget(request.Model, minResponseTokens)
+	if budget <= 0 || estimateRequestInputTokens(*request) <= budget {
+		return nil
+	}
+	originalMessages := append([]api.InputMessage(nil), session.Messages...)
+	baseMessages := stripExistingContextCompactionNotice(originalMessages)
+	if len(baseMessages) <= 1 {
+		return nil
+	}
+	notice := api.UserTextMessage(contextCompactionNotice(activePrompt))
+	for start := 0; start < len(baseMessages); start++ {
+		retained := compactMessagesForContext(baseMessages[start:], contextCompactionPayloadChars)
+		candidate := append([]api.InputMessage{notice}, retained...)
+		if !validToolHistory(candidate) {
+			continue
+		}
+		candidateRequest := *request
+		candidateRequest.Messages = candidate
+		if estimateRequestInputTokens(candidateRequest) > budget {
+			continue
+		}
+		removed := len(originalMessages) - (len(baseMessages) - start)
+		if removed <= 0 {
+			removed = 1
+		}
+		session.Messages = candidate
+		session.RecordCompaction("context-window compaction preserved recent valid tool history", removed)
+		request.Messages = append([]api.InputMessage(nil), candidate...)
+		return &AutoCompaction{
+			RemovedMessages: removed,
+			Notice:          fmt.Sprintf("[context compacted: removed %d old messages]", removed),
+		}
+	}
+	return nil
+}
+
+func contextWindowInputBudget(model string, minResponseTokens int) int {
+	contextWindow := modelContextWindow(model)
+	if contextWindow <= 0 {
+		return 0
+	}
+	return contextWindow - contextBudgetSafetyTokens(contextWindow) - minContextResponseTokens(minResponseTokens)
+}
+
+func minContextResponseTokens(requested int) int {
+	if requested <= 0 {
+		return 512
+	}
+	return min(512, max(128, requested))
+}
+
+func contextCompactionNotice(activePrompt string) string {
+	prompt := truncateMiddle(strings.TrimSpace(activePrompt), 1200)
+	if prompt == "" {
+		return contextCompactionNoticePrefix + "\nEarlier conversation was compacted to fit the model context window. Continue from the recent valid tool history below."
+	}
+	return contextCompactionNoticePrefix + "\nEarlier conversation was compacted to fit the model context window. Continue the active request using the recent valid tool history below.\n\nActive request excerpt:\n" + prompt
+}
+
+func stripExistingContextCompactionNotice(messages []api.InputMessage) []api.InputMessage {
+	if len(messages) == 0 {
+		return nil
+	}
+	start := 0
+	if messageStartsWithText(messages[0], contextCompactionNoticePrefix) {
+		start = 1
+	}
+	return append([]api.InputMessage(nil), messages[start:]...)
+}
+
+func messageStartsWithText(message api.InputMessage, prefix string) bool {
+	for _, block := range message.Content {
+		if block.Type == "text" && strings.HasPrefix(strings.TrimSpace(block.Text), prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func validToolHistory(messages []api.InputMessage) bool {
+	seenToolUseIDs := map[string]struct{}{}
+	for _, message := range messages {
+		for _, block := range message.Content {
+			switch block.Type {
+			case "tool_use":
+				if strings.TrimSpace(block.ID) != "" {
+					seenToolUseIDs[block.ID] = struct{}{}
+				}
+			case "tool_result":
+				if strings.TrimSpace(block.ToolUseID) == "" {
+					return false
+				}
+				if _, ok := seenToolUseIDs[block.ToolUseID]; !ok {
+					return false
+				}
+			}
+		}
+	}
+	return true
+}
+
+func compactMessagesForContext(messages []api.InputMessage, maxChars int) []api.InputMessage {
+	out := make([]api.InputMessage, len(messages))
+	for i, message := range messages {
+		out[i] = api.InputMessage{
+			Role:    message.Role,
+			Content: make([]api.InputContentBlock, len(message.Content)),
+		}
+		for j, block := range message.Content {
+			out[i].Content[j] = compactContentBlockForContext(block, maxChars)
+		}
+	}
+	return out
+}
+
+func compactContentBlockForContext(block api.InputContentBlock, maxChars int) api.InputContentBlock {
+	block.Text = truncateMiddle(block.Text, maxChars)
+	block.Input = compactRawJSONForContext(block.Input, maxChars)
+	if len(block.Content) > 0 {
+		content := make([]api.ToolResultContentBlock, len(block.Content))
+		for i, item := range block.Content {
+			item.Text = truncateMiddle(item.Text, maxChars)
+			item.Value = compactRawJSONForContext(item.Value, maxChars)
+			content[i] = item
+		}
+		block.Content = content
+	}
+	return block
+}
+
+func compactRawJSONForContext(raw json.RawMessage, maxChars int) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var value any
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return raw
+	}
+	value = compactJSONValueForContext(value, maxChars)
+	data, err := json.Marshal(value)
+	if err != nil {
+		return raw
+	}
+	return json.RawMessage(data)
+}
+
+func compactJSONValueForContext(value any, maxChars int) any {
+	switch typed := value.(type) {
+	case string:
+		return truncateMiddle(typed, maxChars)
+	case []any:
+		out := make([]any, len(typed))
+		for i, item := range typed {
+			out[i] = compactJSONValueForContext(item, maxChars)
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(typed))
+		for key, item := range typed {
+			out[key] = compactJSONValueForContext(item, maxChars)
+		}
+		return out
+	default:
+		return value
+	}
+}
+
+func truncateMiddle(value string, maxChars int) string {
+	if maxChars <= 0 || len(value) <= maxChars {
+		return value
+	}
+	omitted := len(value) - maxChars
+	head := maxChars / 2
+	tail := maxChars - head
+	return value[:head] + fmt.Sprintf("\n... [truncated %d chars] ...\n", omitted) + value[len(value)-tail:]
+}
+
+func mergeAutoCompactions(existing, next *AutoCompaction) *AutoCompaction {
+	if existing == nil {
+		return next
+	}
+	if next == nil {
+		return existing
+	}
+	return &AutoCompaction{
+		RemovedMessages: existing.RemovedMessages + next.RemovedMessages,
+		Notice:          strings.TrimSpace(existing.Notice + "\n" + next.Notice),
 	}
 }
 

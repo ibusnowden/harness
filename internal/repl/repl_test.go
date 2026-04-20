@@ -2,6 +2,8 @@ package repl
 
 import (
 	"context"
+	"encoding/json"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -85,6 +87,52 @@ func TestModelRecordsActivityAndShowsInspector(t *testing.T) {
 	}
 	if !strings.Contains(view, `"stdout":"ok"`) {
 		t.Fatalf("expected expanded activity detail in view, got %q", view)
+	}
+}
+
+func TestFileWriteDiffActivityRendersInlineDiff(t *testing.T) {
+	m := newSizedModel()
+	m.busy = true
+	payload, err := json.Marshal(fileDiff{
+		HunkHeader: "@@ -1,1 +1,1 @@",
+		Removed:    []string{"old"},
+		Added:      []string{"new"},
+		StartLine:  1,
+	})
+	if err != nil {
+		t.Fatalf("marshal diff: %v", err)
+	}
+	m.handleActivityEvent(ActivityEvent{
+		Kind:    "file_write",
+		Title:   "sample.go",
+		Summary: "Writing 4 bytes.",
+		Detail:  string(payload),
+	})
+
+	view := stripANSI(m.transcript.View())
+	for _, want := range []string{"sample.go", "@@ -1,1 +1,1 @@", "- old", "+ new"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("expected transcript to contain %q, got %q", want, view)
+		}
+	}
+}
+
+func TestFileWriteInvalidDiffFallsBackToCompactSummary(t *testing.T) {
+	m := newSizedModel()
+	m.busy = true
+	m.handleActivityEvent(ActivityEvent{
+		Kind:    "file_write",
+		Title:   "sample.go",
+		Summary: "Writing 4 bytes.",
+		Detail:  "/tmp/sample.go",
+	})
+
+	view := stripANSI(m.transcript.View())
+	if !strings.Contains(view, "Writing 4 bytes.") {
+		t.Fatalf("expected compact file_write summary, got %q", view)
+	}
+	if strings.Contains(view, "@@") || strings.Contains(view, "- old") || strings.Contains(view, "+ new") {
+		t.Fatalf("did not expect diff content for invalid payload, got %q", view)
 	}
 }
 
@@ -544,4 +592,10 @@ func TestRenderCompletionInactive(t *testing.T) {
 	if out := m.renderCompletion(); out != "" {
 		t.Fatalf("expected empty string when comp.items is empty, got %q", out)
 	}
+}
+
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;]*m`)
+
+func stripANSI(value string) string {
+	return ansiEscapeRE.ReplaceAllString(value, "")
 }

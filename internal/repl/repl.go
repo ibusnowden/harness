@@ -1079,13 +1079,10 @@ func (m *model) handleActivityEvent(msg ActivityEvent) {
 			m.spinVerb = v
 		}
 	}
-	// For file_edit events, render a proper unified diff inline in the transcript.
-	// The Detail already contains a fileDiff JSON payload from builtins.go.
-	if msg.Kind == "file_edit" {
+	// For file edit/write events, render a proper unified diff inline in the
+	// transcript when Detail contains the fileDiff JSON payload from builtins.go.
+	if msg.Kind == "file_edit" || msg.Kind == "file_write" {
 		if diff := renderInlineDiff(msg.Detail, m.theme, m.transcript.Width); diff != "" {
-			// Keep summary as-is (already set by builtins.go: "Editing <path>").
-			// Replace Detail with the rendered diff so timelineEntryForActivity
-			// can include it directly.
 			msg.Detail = diff
 		}
 	}
@@ -1124,6 +1121,13 @@ func timelineEntryForActivity(msg ActivityEvent) (string, string, string) {
 		// Detail is a pre-rendered diff string set in handleActivityEvent.
 		body := formatTimelineBody(msg.Summary, msg.Detail, 20)
 		return label, body, "file_edit"
+	case "file_write":
+		if strings.Contains(msg.Detail, "\n") {
+			label := fallback(msg.Title, "write_file")
+			body := formatTimelineBody(msg.Summary, msg.Detail, 20)
+			return label, body, "file_write"
+		}
+		return fallback(msg.Title, "write_file"), firstLine(msg.Summary), "operation"
 
 	// Noisy result/completion events: suppress from transcript.
 	// Full output is always accessible in the activity pane (F2 / Ctrl+O).
@@ -1142,8 +1146,6 @@ func timelineEntryForActivity(msg ActivityEvent) (string, string, string) {
 	// File ops: show path only, no content.
 	case "file_read":
 		return fallback(msg.Title, "read_file"), firstLine(fallback(msg.Detail, msg.Summary)), "operation"
-	case "file_write":
-		return fallback(msg.Title, "write_file"), firstLine(msg.Summary), "operation"
 
 	// Search: show the pattern / scope hint.
 	case "search":
@@ -1230,6 +1232,8 @@ func (m *model) refreshTranscript() {
 		case "operation":
 			labelStyle = m.theme.Meta()
 		case "file_edit":
+			labelStyle = m.theme.Meta()
+		case "file_write":
 			labelStyle = m.theme.Meta()
 		case "phase":
 			labelStyle = m.theme.Help()
@@ -1359,6 +1363,9 @@ func (m model) renderTimelineBlock(item transcriptEntry) string {
 	case "file_edit":
 		headerStyle = m.theme.Meta().Bold(true)
 		borderStyle = m.theme.Meta()
+	case "file_write":
+		headerStyle = m.theme.Meta().Bold(true)
+		borderStyle = m.theme.Meta()
 	case "error":
 		headerStyle = m.theme.Err()
 		borderStyle = m.theme.Err()
@@ -1381,6 +1388,8 @@ func timelineGlyph(kind, label string) string {
 		return "·"
 	case "file_edit":
 		return "≈"
+	case "file_write":
+		return "←"
 	case "result":
 		return "✓"
 	case "error":
@@ -2105,7 +2114,7 @@ func truncateApprovalInput(input string, maxLines, maxChars int) string {
 }
 
 // fileDiff mirrors the fileDiff struct in internal/tools/builtins.go.
-// It is the JSON payload written into the file_edit activity event Detail field.
+// It is the JSON payload written into file change activity event Detail fields.
 type fileDiff struct {
 	HunkHeader string   `json:"hunk"`
 	Before     []string `json:"before"`
@@ -2115,7 +2124,7 @@ type fileDiff struct {
 	StartLine  int      `json:"start_line"`
 }
 
-// renderInlineDiff parses a file_edit Detail JSON (produced by builtins.go) and
+// renderInlineDiff parses a file change Detail JSON (produced by builtins.go) and
 // returns a unified-diff style string ready for display in the transcript.
 // Returns "" if the detail is not a valid fileDiff payload.
 // width controls the full-line highlight width (pass m.transcript.Width).

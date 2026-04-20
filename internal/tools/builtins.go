@@ -216,25 +216,42 @@ func executeWriteFile(ctx LiveContext, call LiveCall) LiveResult {
 	if err != nil {
 		return liveError(call, err.Error())
 	}
-	emitToolActivity(ctx, LiveToolEvent{
-		Kind:    "file_write",
-		Title:   input.Path,
-		Summary: fmt.Sprintf("Writing %d bytes.", len(input.Content)),
-		Detail:  path,
-	})
+	existed := false
+	beforeContent := ""
+	canBuildDiff := true
+	if data, err := os.ReadFile(path); err == nil {
+		existed = true
+		beforeContent = string(data)
+	} else if !os.IsNotExist(err) {
+		canBuildDiff = false
+	}
+	diffDetail := path
+	if canBuildDiff {
+		if diff := buildWriteFileDiff(beforeContent, input.Content, existed); diff != "" {
+			diffDetail = diff
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return liveError(call, err.Error())
 	}
 	if err := os.WriteFile(path, []byte(input.Content), 0o644); err != nil {
 		return liveError(call, err.Error())
 	}
+	emitToolActivity(ctx, LiveToolEvent{
+		Kind:    "file_write",
+		Title:   input.Path,
+		Summary: fmt.Sprintf("Writing %d bytes.", len(input.Content)),
+		Detail:  diffDetail,
+	})
 	return liveJSON(call, map[string]any{
 		"path":          path,
 		"bytes_written": len(input.Content),
 	})
 }
 
-// fileDiff is the payload written into the file_edit activity event Detail field.
+const maxDiffHunkLines = 12
+
+// fileDiff is the payload written into file change activity event Detail fields.
 // The TUI parses this to render a proper unified diff with context lines.
 type fileDiff struct {
 	HunkHeader string   `json:"hunk"`
@@ -250,7 +267,6 @@ type fileDiff struct {
 // a JSON-encoded fileDiff. Returns "" on any failure (caller falls back gracefully).
 func buildUnifiedDiff(content, oldStr, newStr string) string {
 	const ctxLines = 3
-	const maxHunkLines = 12 // cap removed/added shown; very large edits stay readable
 
 	idx := strings.Index(content, oldStr)
 	if idx < 0 {
@@ -277,14 +293,8 @@ func buildUnifiedDiff(content, oldStr, newStr string) string {
 	}
 
 	// Cap removed/added to keep the diff readable for massive edits.
-	truncatedRemoved := false
-	if len(removed) > maxHunkLines {
-		removed = append(removed[:maxHunkLines], fmt.Sprintf("… (%d more lines)", len(removed)-maxHunkLines))
-		truncatedRemoved = true
-	}
-	if len(added) > maxHunkLines && !truncatedRemoved {
-		added = append(added[:maxHunkLines], fmt.Sprintf("… (%d more lines)", len(added)-maxHunkLines))
-	}
+	removed = compactDiffLines(removed, maxDiffHunkLines)
+	added = compactDiffLines(added, maxDiffHunkLines)
 
 	// Unified diff hunk header: @@ -old_start,old_count +new_start,new_count @@
 	oldCount := len(before) + oldLineCount + len(after)
@@ -305,6 +315,61 @@ func buildUnifiedDiff(content, oldStr, newStr string) string {
 		return ""
 	}
 	return string(enc)
+}
+
+func buildWriteFileDiff(beforeContent, afterContent string, existed bool) string {
+	if existed && beforeContent == afterContent {
+		return ""
+	}
+	removed := []string{}
+	if existed {
+		removed = splitDiffLines(beforeContent)
+	}
+	added := splitDiffLines(afterContent)
+	if len(removed) == 0 && len(added) == 0 {
+		return ""
+	}
+	oldStart := 1
+	oldCount := len(removed)
+	if !existed {
+		oldStart = 0
+		oldCount = 0
+	}
+	newCount := len(added)
+	payload := fileDiff{
+		HunkHeader: fmt.Sprintf("@@ -%d,%d +1,%d @@", oldStart, oldCount, newCount),
+		Removed:    compactDiffLines(removed, maxDiffHunkLines),
+		Added:      compactDiffLines(added, maxDiffHunkLines),
+		StartLine:  1,
+	}
+	enc, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(enc)
+}
+
+func splitDiffLines(content string) []string {
+	if content == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	if strings.HasSuffix(content, "\n") && len(lines) > 0 {
+		lines = lines[:len(lines)-1]
+	}
+	return cloneLines(lines)
+}
+
+func compactDiffLines(lines []string, limit int) []string {
+	if len(lines) == 0 {
+		return nil
+	}
+	if limit <= 0 || len(lines) <= limit {
+		return cloneLines(lines)
+	}
+	out := cloneLines(lines[:limit])
+	out = append(out, fmt.Sprintf("… (%d more lines)", len(lines)-limit))
+	return out
 }
 
 func cloneLines(src []string) []string {
@@ -347,16 +412,16 @@ func executeEditFile(ctx LiveContext, call LiveCall) LiveResult {
 	if diffDetail == "" {
 		diffDetail = path // graceful fallback
 	}
+	updated := strings.Replace(content, input.OldString, input.NewString, 1)
+	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
+		return liveError(call, err.Error())
+	}
 	emitToolActivity(ctx, LiveToolEvent{
 		Kind:    "file_edit",
 		Title:   input.Path,
 		Summary: "Editing " + input.Path,
 		Detail:  diffDetail,
 	})
-	updated := strings.Replace(content, input.OldString, input.NewString, 1)
-	if err := os.WriteFile(path, []byte(updated), 0o644); err != nil {
-		return liveError(call, err.Error())
-	}
 	return liveJSON(call, map[string]any{
 		"path": path,
 	})
