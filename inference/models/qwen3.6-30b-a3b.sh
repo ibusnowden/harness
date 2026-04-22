@@ -2,7 +2,7 @@ MODEL_ID="Qwen/Qwen3.6-35B-A3B"
 SERVED_NAME="qwen3.6-30b-a3b"
 PORT=8000
 TENSOR_PARALLEL=1
-MAX_MODEL_LEN=16384
+MAX_MODEL_LEN=262144
 TOOL_CALL_PARSER="qwen3_xml"
 REASONING_PARSER="qwen3"
 # fp8 cuts weights from ~70GB to ~35GB on H100 — no speed penalty, native support

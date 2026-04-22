@@ -271,7 +271,7 @@ func TestLiveHarnessSendsDefaultSystemPrompt(t *testing.T) {
 	}
 }
 
-func TestLiveHarnessClampsMaxTokensForContextConstrainedQwenRequests(t *testing.T) {
+func TestLiveHarnessLeavesQwenMaxTokensUnclampedForNormalLongRequests(t *testing.T) {
 	var seenMaxTokens int
 	restoreTransport := api.SetTransportForTesting(roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		data, err := io.ReadAll(request.Body)
@@ -314,8 +314,95 @@ func TestLiveHarnessClampsMaxTokensForContextConstrainedQwenRequests(t *testing.
 	if seenMaxTokens <= 0 {
 		t.Fatalf("expected a max_tokens value, got %d", seenMaxTokens)
 	}
-	if seenMaxTokens >= 4096 {
-		t.Fatalf("expected context-aware max_tokens clamp, got %d", seenMaxTokens)
+	if seenMaxTokens != 4096 {
+		t.Fatalf("expected full Qwen output budget, got %d", seenMaxTokens)
+	}
+}
+
+func TestModelContextWindowUsesFullQwenContext(t *testing.T) {
+	for _, model := range []string{"qwen3.6-30b-a3b", "Qwen/Qwen3.6-35B-A3B"} {
+		if got := modelContextWindow(model); got != 262144 {
+			t.Fatalf("expected full Qwen context for %q, got %d", model, got)
+		}
+	}
+}
+
+func TestAutoCompactionGeneratesSemanticSummary(t *testing.T) {
+	var calls int
+	var summaryPrompt string
+	var finalPayload api.MessageRequest
+	restoreTransport := api.SetTransportForTesting(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		data, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		var payload api.MessageRequest
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatalf("decode request body: %v", err)
+		}
+		if payload.System == semanticCompactionSystemPrompt() {
+			if len(payload.Messages) != 1 || len(payload.Messages[0].Content) != 1 {
+				t.Fatalf("unexpected semantic compaction prompt payload: %#v", payload.Messages)
+			}
+			summaryPrompt = payload.Messages[0].Content[0].Text
+			return sseResponse(finalTextSSEForTest("Goals: preserve alpha architecture details. Files: harness/internal/runtime/live.go. Open tasks: run tests.")), nil
+		}
+		finalPayload = payload
+		return sseResponse(finalTextSSEForTest("continued")), nil
+	}))
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://mock.anthropic.local")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+
+	session := sessions.NewManagedSession("semantic-seed", "sonnet")
+	session.Meta.Usage = api.Usage{InputTokens: 60000}
+	session.Messages = []api.InputMessage{
+		api.UserTextMessage("User goal: preserve alpha architecture details"),
+		{Role: "assistant", Content: []api.InputContentBlock{{Type: "text", Text: "Decision: edit harness/internal/runtime/live.go"}}},
+		api.UserTextMessage("Run targeted runtime tests after editing"),
+		{Role: "assistant", Content: []api.InputContentBlock{{Type: "text", Text: "Acknowledged test plan"}}},
+		api.UserTextMessage("Recent user note"),
+		{Role: "assistant", Content: []api.InputContentBlock{{Type: "text", Text: "Recent assistant note"}}},
+	}
+	if _, err := sessions.SaveManaged(session, root); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	harness, err := NewLiveHarness(root)
+	if err != nil {
+		t.Fatalf("new live harness: %v", err)
+	}
+	summary, err := harness.RunPrompt(context.Background(), "continue", PromptOptions{
+		Model:                  "sonnet",
+		PermissionMode:         tools.PermissionWorkspaceWrite,
+		ResumeSession:          "semantic-seed",
+		AutoCompactInputTokens: 50000,
+	})
+	if err != nil {
+		t.Fatalf("run prompt: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected semantic summary call plus final prompt call, got %d", calls)
+	}
+	if !strings.Contains(summaryPrompt, "alpha architecture details") {
+		t.Fatalf("expected summary prompt to include older transcript, got %q", summaryPrompt)
+	}
+	if summary.AutoCompaction == nil || !strings.Contains(summary.AutoCompaction.Notice, "semantic compacted") {
+		t.Fatalf("expected semantic auto compaction, got %#v", summary.AutoCompaction)
+	}
+	if len(finalPayload.Messages) == 0 || semanticSummaryFromMessage(finalPayload.Messages[0]) == "" {
+		t.Fatalf("expected final prompt to start with semantic compaction summary, got %#v", finalPayload.Messages)
+	}
+	if !strings.Contains(semanticSummaryFromMessage(finalPayload.Messages[0]), "harness/internal/runtime/live.go") {
+		t.Fatalf("expected generated summary in final prompt, got %#v", finalPayload.Messages[0])
+	}
+	if strings.Contains(summaryJSON(finalPayload.Messages), "User goal: preserve alpha architecture details") {
+		t.Fatalf("expected old raw messages to be replaced by summary, got %#v", finalPayload.Messages)
 	}
 }
 
@@ -361,7 +448,7 @@ func TestContextAwareMaxTokensUsesObservedInputTokensForLaterIterations(t *testi
 		InputTokens:  14950,
 		MessageCount: 1,
 	}
-	got := contextAwareMaxTokens(request, 4096, observed)
+	got := contextAwareMaxTokensWithWindow(request, 4096, observed, 16384)
 	if got >= 4096 {
 		t.Fatalf("expected observed input tokens to clamp max tokens, got %d", got)
 	}
@@ -371,7 +458,7 @@ func TestContextAwareMaxTokensUsesObservedInputTokensForLaterIterations(t *testi
 }
 
 func TestContextWindowCompactionKeepsValidToolHistory(t *testing.T) {
-	session := sessions.NewManagedSession("session-1", "qwen3.6-30b-a3b")
+	session := sessions.NewManagedSession("session-1", "glm-4.7-flash")
 	session.Messages = []api.InputMessage{
 		api.UserTextMessage("implement a long plan"),
 		{
@@ -385,7 +472,7 @@ func TestContextWindowCompactionKeepsValidToolHistory(t *testing.T) {
 		},
 		api.ToolResultMessage([]api.ToolResultEnvelope{{
 			ToolUseID: "toolu_old",
-			Output:    strings.Repeat("old output\n", 8000),
+			Output:    strings.Repeat("old output\n", 15000),
 		}}),
 		{
 			Role: "assistant",
@@ -402,7 +489,7 @@ func TestContextWindowCompactionKeepsValidToolHistory(t *testing.T) {
 		}}),
 	}
 	request := api.MessageRequest{
-		Model:    "qwen3.6-30b-a3b",
+		Model:    "glm-4.7-flash",
 		System:   "system prompt",
 		Messages: append([]api.InputMessage(nil), session.Messages...),
 	}
@@ -423,8 +510,8 @@ func TestContextWindowCompactionKeepsValidToolHistory(t *testing.T) {
 }
 
 func TestContextWindowCompactionCompactsLargeToolInputs(t *testing.T) {
-	largeContent := strings.Repeat("x", 100000)
-	session := sessions.NewManagedSession("session-1", "qwen3.6-30b-a3b")
+	largeContent := strings.Repeat("x", 200000)
+	session := sessions.NewManagedSession("session-1", "glm-4.7-flash")
 	session.Messages = []api.InputMessage{
 		api.UserTextMessage("write a large generated file"),
 		{
@@ -443,7 +530,7 @@ func TestContextWindowCompactionCompactsLargeToolInputs(t *testing.T) {
 		}}),
 	}
 	request := api.MessageRequest{
-		Model:    "qwen3.6-30b-a3b",
+		Model:    "glm-4.7-flash",
 		System:   "system prompt",
 		Messages: append([]api.InputMessage(nil), session.Messages...),
 	}
@@ -475,6 +562,110 @@ func TestContextWindowCompactionCompactsLargeToolInputs(t *testing.T) {
 	if !validToolHistory(session.Messages) {
 		t.Fatalf("compacted messages contain dangling tool results: %#v", session.Messages)
 	}
+}
+
+func TestOpenAIContextLimitErrorTriggersCompactedRetry(t *testing.T) {
+	var calls int
+	var retryMessages []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+	var retryMaxTokens int
+	restoreTransport := api.SetTransportForTesting(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls++
+		data, err := io.ReadAll(request.Body)
+		if err != nil {
+			t.Fatalf("read request body: %v", err)
+		}
+		if calls == 1 {
+			return &http.Response{
+				StatusCode: http.StatusBadRequest,
+				Status:     "400 Bad Request",
+				Body: io.NopCloser(strings.NewReader(
+					`{"error":{"message":"This model's maximum context length is 16384 tokens. However, you requested 2479 output tokens and your prompt contains at least 20000 input tokens, for a total of at least 22479 tokens. Please reduce the length of the input prompt or the number of requested output tokens.","type":"BadRequestError","param":"input_tokens","code":400,"value":20000}}`,
+				)),
+			}, nil
+		}
+		var payload struct {
+			MaxTokens int `json:"max_tokens"`
+			Messages  []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(data, &payload); err != nil {
+			t.Fatalf("decode retry request body: %v", err)
+		}
+		retryMaxTokens = payload.MaxTokens
+		retryMessages = payload.Messages
+		return sseResponse(openAITextSSEForTest("ok")), nil
+	}))
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("OPENAI_API_KEY", "test-key")
+	t.Setenv("OPENAI_BASE_URL", "https://mock.openai.local/v1")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+
+	session := sessions.NewManagedSession("too-long", "qwen3.6-30b-a3b")
+	session.Messages = []api.InputMessage{
+		api.UserTextMessage("old request"),
+		{
+			Role: "assistant",
+			Content: []api.InputContentBlock{{
+				Type:  "tool_use",
+				ID:    "toolu_old",
+				Name:  "read_file",
+				Input: json.RawMessage(`{"path":"old.txt"}`),
+			}},
+		},
+		api.ToolResultMessage([]api.ToolResultEnvelope{{
+			ToolUseID: "toolu_old",
+			Output:    strings.Repeat("old output\n", 15000),
+		}}),
+	}
+	if _, err := sessions.SaveManaged(session, root); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	harness, err := NewLiveHarness(root)
+	if err != nil {
+		t.Fatalf("new live harness: %v", err)
+	}
+	summary, err := harness.RunPrompt(context.Background(), "continue", PromptOptions{
+		Model:          "qwen3.6-30b-a3b",
+		Provider:       api.ProviderOpenAI,
+		PermissionMode: tools.PermissionWorkspaceWrite,
+		ResumeSession:  "too-long",
+	})
+	if err != nil {
+		t.Fatalf("run prompt: %v", err)
+	}
+	if summary.AutoCompaction == nil {
+		t.Fatalf("expected context compaction during retry, retry messages=%#v max_tokens=%d", retryMessages, retryMaxTokens)
+	}
+	if calls != 2 {
+		t.Fatalf("expected one retry, got %d calls", calls)
+	}
+	if retryMaxTokens <= 0 || retryMaxTokens > 4096 {
+		t.Fatalf("expected retry max_tokens to be recomputed, got %d", retryMaxTokens)
+	}
+	if !messagesContainText(retryMessages, contextCompactionNoticePrefix) {
+		t.Fatalf("expected retry to include context compaction notice, got %#v", retryMessages)
+	}
+}
+
+func messagesContainText(messages []struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}, text string) bool {
+	for _, message := range messages {
+		if strings.Contains(message.Content, text) {
+			return true
+		}
+	}
+	return false
 }
 
 func assertPromptPhases(t *testing.T, got, want []PromptPhase) {

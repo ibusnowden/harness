@@ -330,7 +330,7 @@ FP8 weights:  35B params × 1 byte  = 35 GB
 - **GPTQ**: Hessian-based layer-wise quantization; 4-bit; Marlin kernel gives 2.6× speedup
 - **QAT** (Quantization-Aware Training): quantization baked into training; highest quality; not post-hoc
 
-### 2.6 Tool Call Parsing — Hermes Protocol
+### 2.6 Tool Call Parsing — Qwen3 XML Protocol
 
 When the model wants to call a function, it emits XML-tagged JSON in its response stream:
 
@@ -340,7 +340,7 @@ When the model wants to call a function, it emits XML-tagged JSON in its respons
 </tool_call>
 ```
 
-vLLM's Hermes parser (`--tool-call-parser hermes`) intercepts this in the response stream and converts it to the OpenAI tool_calls format before returning it to the caller:
+vLLM's Qwen3 XML parser (`--tool-call-parser qwen3_xml`) intercepts this in the response stream and converts it to the OpenAI tool_calls format before returning it to the caller:
 
 ```json
 {
@@ -364,9 +364,9 @@ vLLM's Hermes parser (`--tool-call-parser hermes`) intercepts this in the respon
 
 The harness then parses this OpenAI format to dispatch to the actual tool implementation.
 
-### 2.7 Reasoning Parser — DeepSeek R1 Format
+### 2.7 Reasoning Parser — Qwen3 Format
 
-The `--reasoning-parser deepseek_r1` flag configures vLLM to split the model's output at `<think>…</think>` boundaries:
+The `--reasoning-parser qwen3` flag configures vLLM to split the model's output at `<think>…</think>` boundaries:
 
 ```
 Raw model output:
@@ -401,7 +401,7 @@ POST /v1/completions          → raw completion (legacy)
 **Chat completions request** (what the harness sends):
 ```json
 {
-  "model": "qwen3-30b-a3b",
+  "model": "qwen3.6-30b-a3b",
   "messages": [
     {"role": "system", "content": "..."},
     {"role": "user", "content": "..."},
@@ -459,60 +459,65 @@ This layer bridges the raw GPU cluster (SLURM + NVIDIA) to the serving API that 
 inference/
 ├── serve.sh              ← SLURM job submission script
 ├── connect.sh            ← SSH tunnel for remote access
+├── endpoint.sh           ← print active OpenAI-compatible endpoint
 ├── docker-compose.yml    ← alternative Docker-based deployment
 ├── requirements.txt      ← vllm>=0.8.5, huggingface_hub>=0.23.0
 ├── logs/                 ← SLURM stdout/stderr per job
 └── models/
-    ├── qwen3-30b-a3b.sh  ← model configuration
+    ├── qwen3.6-30b-a3b.sh ← model configuration
     └── glm-4.7-flash.sh  ← alternative model
 ```
 
 ### serve.sh — SLURM Submission
 
 ```bash
-sbatch inference/serve.sh qwen3-30b-a3b
+sbatch inference/serve.sh qwen3.6-30b-a3b
 ```
 
 **SLURM directives** (embedded as `#SBATCH` comments):
 ```
 --partition=bigTiger       # GPU partition
---nodelist=itiger01        # specific GPU node
---gres=gpu:1               # 1 GPU
+--gres=gpu:h100_80gb:1     # 1 H100 80GB GPU
 --cpus-per-task=16         # 16 CPU cores for data loading / tokenization
---mem=64G                  # 64 GB RAM for HF model loading + serving
+--mem=128G                 # 128 GB RAM for HF model loading + serving
 ```
 
 **What it runs**:
-1. Sources `models/qwen3-30b-a3b.sh` to load `MODEL_ID`, `PORT`, `EXTRA_ARGS`, etc.
-2. Sets `HF_HOME=/project/inniang/hf-cache` (shared HuggingFace model cache)
-3. Activates Python venv at `/project/inniang/.venv`
-4. Launches `python -m vllm.entrypoints.openai.api_server` with all flags
+1. Sources `models/qwen3.6-30b-a3b.sh` to load `MODEL_ID`, `PORT`, `EXTRA_ARGS`, etc.
+2. Verifies that Slurm exposed an H100 before writing endpoint metadata
+3. Sets `HF_HOME=/project/inniang/hf-cache` (shared HuggingFace model cache)
+4. Activates Python venv at `/project/inniang/.venv`
+5. Launches `python -m vllm.entrypoints.openai.api_server` with all flags
 
-### models/qwen3-30b-a3b.sh — Model Configuration
+### models/qwen3.6-30b-a3b.sh — Model Configuration
 
 ```bash
 MODEL_ID="Qwen/Qwen3.6-35B-A3B"        # HuggingFace model ID
-SERVED_NAME="qwen3-30b-a3b"             # name exposed in /v1/models
+SERVED_NAME="qwen3.6-30b-a3b"           # name exposed in /v1/models
 PORT=8000
 TENSOR_PARALLEL=1                        # single GPU
-MAX_MODEL_LEN=16384                      # 16K context window cap
-TOOL_CALL_PARSER="hermes"
-REASONING_PARSER="deepseek_r1"
-EXTRA_ARGS="--quantization fp8 --gpu-memory-utilization 0.90"
+MAX_MODEL_LEN=262144                     # long-context profile
+TOOL_CALL_PARSER="qwen3_xml"
+REASONING_PARSER="qwen3"
+EXTRA_ARGS="--quantization fp8 --gpu-memory-utilization 0.90 --gdn-prefill-backend triton"
 ```
 
-Note: `MAX_MODEL_LEN=16384` caps the effective context window regardless of the model's 131K native capacity — a deliberate memory trade-off for this single-GPU deployment.
+Note: the H100-only Slurm request and the runtime GPU check keep this profile
+from silently falling back to RTX nodes.
 
 ### connect.sh — SSH Tunnel
 
-If the machine running the harness cannot reach `itiger01` directly (e.g., behind a login node firewall):
+If the machine running the harness cannot reach the active H100 Slurm node
+directly (e.g., behind a login node firewall):
 
 ```bash
-./inference/connect.sh qwen3-30b-a3b
-# → ssh -NL 8000:itiger01:8000 itiger01
+./inference/connect.sh qwen3.6-30b-a3b
+# → ssh -NL 8000:<h100-node>:8000 <h100-node>
 ```
 
-This forwards `localhost:8000` → `itiger01:8000`, allowing the harness to talk to `http://localhost:8000/v1` while the actual vLLM process runs on the GPU node.
+This forwards `localhost:8000` to the active H100 Slurm node, allowing the
+harness to talk to `http://localhost:8000/v1` while the actual vLLM process
+runs on the GPU node.
 
 ### HuggingFace Model Download
 
@@ -588,7 +593,7 @@ ASCARIS_CONFIG_HOME env var       (override config home location)
 **Relevant config keys for this deployment**:
 ```json
 {
-  "model": "qwen3-30b-a3b",
+  "model": "qwen3.6-30b-a3b",
   "provider": {
     "kind": "openai",
     "openai_base_url": "http://localhost:8000/v1",
@@ -860,7 +865,7 @@ User types: "refactor internal/api/types.go to add a Timeout field"
                      ▼
           ┌──────────────────────────┐
           │  Config (config.go)      │
-          │  model: qwen3-30b-a3b    │
+          │  model: qwen3.6-30b-a3b  │
           │  base_url: :8000/v1      │
           └──────────┬───────────────┘
                      │
@@ -875,18 +880,18 @@ User types: "refactor internal/api/types.go to add a Timeout field"
           │  Live Harness (live.go)  — Iteration 1       │
           │                                              │
           │  POST /v1/chat/completions                   │
-          │  { model: "qwen3-30b-a3b",                   │
+          │  { model: "qwen3.6-30b-a3b",                 │
           │    messages: [system, user],                  │
           │    tools: [read_file, write_file, ...] }     │
           └──────────────┬───────────────────────────────┘
                          │  HTTP SSE stream
                          ▼
           ┌──────────────────────────────────────────────┐
-          │  vLLM :8000 (itiger01, via SSH tunnel)       │
+          │  vLLM :8000 (active H100 node, via tunnel)   │
           │                                              │
           │  Prefill: tokenize + forward pass on prompt  │
           │  Decode:  generate tool call tokens          │
-          │  Parser:  hermes → extract tool_call JSON    │
+          │  Parser:  qwen3_xml → extract tool_call JSON │
           │                                              │
           │  SSE response:                               │
           │  {"choices":[{"delta":{"tool_calls":[{       │
@@ -956,17 +961,17 @@ User types: "refactor internal/api/types.go to add a Timeout field"
 |-------|-----------|----------------|-------|
 | Silicon | NVIDIA H100 | SM / Tensor Core / HBM3 | Hardware |
 | Model | Qwen3.6-35B-A3B | MoE + GQA + RoPE + FlashAttn | `/project/inniang/hf-cache` |
-| Serving | vLLM | PagedAttention + continuous batching | `itiger01:8000` |
+| Serving | vLLM | PagedAttention + continuous batching | active H100 node |
 | Deployment | SLURM + Python venv | serve.sh + model config | `inference/` |
 | Harness | ascaris (Go) | MessageClient + tool loop | `internal/` |
 
 | Serving flag | Purpose |
 |---|---|
 | `--model Qwen/Qwen3.6-35B-A3B` | HF model ID |
-| `--served-model-name qwen3-30b-a3b` | Name in API |
+| `--served-model-name qwen3.6-30b-a3b` | Name in API |
 | `--quantization fp8` | FP8 weights: 35 GB vs 70 GB BF16 |
 | `--gpu-memory-utilization 0.90` | Reserve 90% VRAM for model+KV cache |
-| `--max-model-len 16384` | Cap context to 16K (single-GPU trade-off) |
+| `--max-model-len 262144` | Long-context profile |
 | `--enable-auto-tool-choice` | Model can emit tool calls |
-| `--tool-call-parser hermes` | Parse `<tool_call>` XML → OpenAI JSON |
-| `--reasoning-parser deepseek_r1` | Split `<think>` reasoning from answer |
+| `--tool-call-parser qwen3_xml` | Parse `<tool_call>` XML → OpenAI JSON |
+| `--reasoning-parser qwen3` | Split `<think>` reasoning from answer |

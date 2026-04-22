@@ -53,6 +53,19 @@ var defaultPromptPhrases = []string{
 
 var defaultSpinnerFrames = []string{"-", "\\", "|", "/"}
 
+// wormSpinnerFrames are worm-themed spinner frames for the TUI.
+var wormSpinnerFrames = []string{"◜", "◠", "◝", "◞", "◡", "◟"}
+
+// enhancedSpinnerPhrases are additional contextual phrases for the spinner.
+var enhancedSpinnerPhrases = []string{
+	"Processing your request",
+	"Analyzing the codebase",
+	"Running tests",
+	"Building the plan",
+	"Waiting for approval",
+	"Compiling results",
+}
+
 type fdWriter interface {
 	Fd() uintptr
 }
@@ -259,4 +272,26 @@ func (s *PromptSpinner) currentPhrase() string {
 		s.phraseIndex = 0
 	}
 	return s.phrases[s.phraseIndex]
+}
+
+// Shimmer returns the current frame with alternating bold/normal for shimmer effect.
+func (s *PromptSpinner) Shimmer(tick int) string {
+	if len(s.frames) == 0 {
+		return ""
+	}
+	frame := s.frames[s.frameIndex%len(s.frames)]
+	if tick%2 == 0 {
+		return "\033[1m" + frame + "\033[22m"
+	}
+	return frame
+}
+
+// WormFrames returns the worm-themed spinner frames.
+func WormFrames() []string {
+	return append([]string(nil), wormSpinnerFrames...)
+}
+
+// EnhancedPhrases returns the enhanced contextual phrases.
+func EnhancedPhrases() []string {
+	return append([]string(nil), enhancedSpinnerPhrases...)
 }

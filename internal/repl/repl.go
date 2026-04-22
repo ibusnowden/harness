@@ -945,7 +945,7 @@ func (m model) View() string {
 	main := m.renderMainContent()
 	completionOverlay := m.renderCompletion()
 	composer := m.panel(m.renderComposerInner(), m.width-2, 2, m.focus == focusInput)
-	footer := m.theme.Help().Render("Enter send • Up/Down scroll • / autocomplete • Ctrl+J newline • F2 activity • Ctrl+T tasks • Tab focus • Ctrl+D exit")
+	footer := m.footerHints()
 	parts := []string{header, strip, main}
 	if completionOverlay != "" {
 		parts = append(parts, completionOverlay)
@@ -1517,31 +1517,51 @@ func (m model) renderPermissionBadge() string {
 
 func (m model) renderHeader() string {
 	var wormPart string
+	var statusDot string
+
 	if m.busy && m.approval == nil {
 		worm := wormFrames[m.spinFrame%len(wormFrames)]
-		wormStr := m.theme.Accent().Render(worm + " ")
+		shimmer := ""
+		if m.spinFrame%4 < 2 {
+			shimmer = "\033[1m"
+		}
+		wormStr := m.theme.Accent().Render(shimmer + worm + " " + "\033[22m")
 		verb := m.spinVerb
 		if verb == "" {
 			verb = "Working"
 		}
 		wormPart = wormStr + m.theme.Accent().Bold(true).Render(verb+"…")
+		statusDot = m.theme.Success().Render("●")
+	} else if m.approval != nil {
+		statusDot = m.theme.Err().Bold(true).Render("●")
+		wormPart = m.theme.Primary().Render(wormFrames[0] + " ") + m.theme.Primary().Render(m.status.Product)
 	} else {
-		// Idle: static worm glyph + product name, no animation.
-		wormPart = m.theme.Primary().Render(wormFrames[0]+" ") + m.theme.Primary().Render(m.status.Product)
+		statusDot = m.theme.Help().Render("●")
+		wormPart = m.theme.Primary().Render(wormFrames[0] + " ") + m.theme.Primary().Render(m.status.Product)
 	}
+
 	left := []string{
 		wormPart,
 		m.theme.Meta().Render(m.cwdShort),
 	}
+
+	var costBadge string
+	if strings.TrimSpace(m.status.CostEst) != "" {
+		costBadge = m.theme.Badge(false, false, false).Render(m.status.CostEst)
+	} else if m.status.TokensIn > 0 || m.status.TokensOut > 0 {
+		costBadge = m.theme.Badge(false, false, false).Render(
+			fmt.Sprintf("↑%d ↓%d", m.status.TokensIn, m.status.TokensOut))
+	}
+
 	right := []string{
 		m.theme.Meta().Render(fmt.Sprintf("Session %s", fallback(m.status.SessionID, "new"))),
-		m.theme.Meta().Render(fmt.Sprintf("%s • %s", fallback(m.status.Model, "unknown"), fallback(m.status.Provider, "auto"))) + " • " + m.renderPermissionBadge(),
-		m.theme.Meta().Render(fmt.Sprintf("Status %s", fallback(m.statusText, "Idle"))),
+		m.theme.Meta().Render(fmt.Sprintf("%s • %s",
+			fallback(m.status.Model, "unknown"),
+			fallback(m.status.Provider, "auto"))) + " • " + m.renderPermissionBadge(),
+		statusDot + " " + m.theme.Meta().Render(fmt.Sprintf("Status %s", fallback(m.statusText, "Idle"))),
 	}
-	if strings.TrimSpace(m.status.CostEst) != "" {
-		right = append(right, m.theme.Meta().Render(m.status.CostEst))
-	} else if m.status.TokensIn > 0 || m.status.TokensOut > 0 {
-		right = append(right, m.theme.Meta().Render(fmt.Sprintf("↑%d ↓%d tok", m.status.TokensIn, m.status.TokensOut)))
+	if costBadge != "" {
+		right = append(right, costBadge)
 	}
 	return lipgloss.JoinHorizontal(lipgloss.Top,
 		lipgloss.NewStyle().Width(max(10, (m.width-6)/2)).Render(strings.Join(left, "\n")),
@@ -1551,11 +1571,26 @@ func (m model) renderHeader() string {
 
 func (m model) renderActivityStrip() string {
 	summary := fallback(strings.TrimSpace(m.activityHint), "Idle: waiting for a prompt.")
+
+	indicator := "■"
+	if m.busy {
+		indicator = wormFrames[m.spinFrame%len(wormFrames)]
+		if m.spinFrame%4 < 2 {
+			indicator = "\033[1m" + indicator + "\033[22m"
+		}
+	}
+
+	if m.busy && m.spinFrame%6 < 3 {
+		summary = "\033[1m" + summary + "\033[22m"
+	}
+
 	suffix := " [F2 details]"
 	if m.showActivity {
 		suffix = " [F2 hide]"
 	}
-	return m.theme.Accent().Width(max(10, m.width-2)).Render(summary + suffix)
+
+	return m.theme.Accent().Width(max(10, m.width-2)).Render(
+		indicator + " " + summary + suffix)
 }
 
 func (m model) renderMainContent() string {
@@ -1591,8 +1626,18 @@ func (m model) renderTaskPanel() string {
 		}
 	}
 	open := len(tl) - done
-	header := m.theme.Accent().Render(fmt.Sprintf("Tasks (%d done, %d open) · ctrl+t to hide", done, open))
-	lines := []string{header, ""}
+	var lines []string
+	// Card header with progress
+	lines = append(lines, m.theme.CardHeader().Width(max(8, m.activity.Width-4)).Render("  TASKS"))
+	lines = append(lines, m.theme.CardDivider().Render(strings.Repeat("─", max(8, m.activity.Width-4))))
+	lines = append(lines, "")
+	lines = append(lines, m.theme.Meta().Render(fmt.Sprintf("%d done, %d open · ctrl+t to hide", done, open)))
+	// Progress bar
+	total := done + open
+	if total > 0 {
+		lines = append(lines, ProgressBar(m.theme, float64(done)/float64(total), max(8, m.activity.Width-4)))
+		lines = append(lines, "")
+	}
 	panelWidth := m.activity.Width
 	for _, t := range tl {
 		blocked := tasks.IsBlocked(t, tl)
@@ -1687,6 +1732,9 @@ func (m model) renderHeroCard(width int) string {
 		return lipgloss.PlaceHorizontal(width, lipgloss.Center, s)
 	}
 
+	header := m.theme.CardHeader().Width(max(8, width-4)).Render("  ASCARIS WORKSPACE")
+	divider := m.theme.CardDivider().Render(strings.Repeat("─", max(8, width-4)))
+
 	logo := renderLogo(width, m.theme)
 	infoLine := fmt.Sprintf("%s  %s  %s",
 		fallback(m.status.Version, ""),
@@ -1694,7 +1742,13 @@ func (m model) renderHeroCard(width int) string {
 		filepathBase(m.status.Workspace),
 	)
 
-	lines := []string{logo, ""}
+	lines := []string{
+		header,
+		divider,
+		"",
+		logo,
+		"",
+	}
 
 	// Show the animated worm art when there is enough vertical room.
 	if m.transcript.Height >= 30 {
@@ -1705,56 +1759,67 @@ func (m model) renderHeroCard(width int) string {
 		center(m.theme.Body().Bold(true).Render("Welcome back")),
 		center(m.theme.Meta().Render(strings.TrimSpace(infoLine))),
 		"",
-		center(m.theme.Meta().Render(fmt.Sprintf("%s • %s • %s",
-			fallback(m.status.Model, "unknown"),
-			fallback(m.status.Provider, "auto"),
-			fallback(m.status.Permission, "workspace-write"),
-		))),
+		center(m.theme.Badge(false, false, false).Render(
+			fmt.Sprintf("%s • %s • %s",
+				fallback(m.status.Model, "unknown"),
+				fallback(m.status.Provider, "auto"),
+				fallback(m.status.Permission, "workspace-write"),
+			))),
 	)
 
 	return lipgloss.Place(width, max(10, m.transcript.Height), lipgloss.Center, lipgloss.Center, strings.Join(lines, "\n"))
 }
 
 func (m model) renderRecentCard(width int) string {
-	title := m.theme.Primary().Render("Recent Session")
-	sep := m.theme.Help().Render(strings.Repeat("─", max(10, width)))
+	header := m.theme.CardHeader().Width(max(8, width-4)).Render("  RECENT SESSION")
+	sep := m.theme.CardDivider().Render(strings.Repeat("─", max(8, width-4)))
 	if strings.TrimSpace(m.status.Recent.ID) == "" {
 		return strings.Join([]string{
-			title,
+			header,
 			sep,
-			m.theme.Meta().Render("No recent managed session."),
-			m.theme.Meta().Render("Start a prompt to create one."),
+			m.theme.Meta().Render("  No recent managed session."),
+			m.theme.Meta().Render("  Start a prompt to create one."),
 		}, "\n")
 	}
 	lines := []string{
-		title,
+		header,
 		sep,
-		m.theme.Meta().Render("ID  " + m.status.Recent.ID),
-		m.theme.Meta().Render(fmt.Sprintf("Msgs  %d", m.status.Recent.MessageCount)),
+		"  ID  " + m.theme.Body().Render(m.status.Recent.ID),
+		"  Msgs  " + m.theme.Body().Render(fmt.Sprintf("%d", m.status.Recent.MessageCount)),
 	}
 	if strings.TrimSpace(m.status.Recent.UpdatedLabel) != "" {
-		lines = append(lines, m.theme.Meta().Render(m.status.Recent.UpdatedLabel))
+		lines = append(lines, "  "+m.theme.Meta().Render(m.status.Recent.UpdatedLabel))
 	}
 	if strings.TrimSpace(m.status.Recent.LastPrompt) != "" {
-		lines = append(lines, "", m.theme.Help().Render("Last:"),
-			m.theme.Body().Width(width).Render(m.status.Recent.LastPrompt))
+		lines = append(lines, "", m.theme.Help().Render("  Last:"),
+			m.theme.Body().Width(width-4).Render("  "+m.status.Recent.LastPrompt))
 	}
+	lines = append(lines, "", m.theme.Help().Render("  /resume <id> to reopen"))
 	return strings.Join(lines, "\n")
 }
 
 func (m model) renderTipsCard(width int) string {
+	header := m.theme.CardHeader().Width(max(8, width-4)).Render("  QUICK START")
+	sep := m.theme.CardDivider().Render(strings.Repeat("─", max(8, width-4)))
+
 	lines := []string{
-		m.theme.Primary().Render("Quick Start — Bug Finding"),
-		m.theme.Help().Render(strings.Repeat("─", max(10, width))),
-		m.theme.Body().Width(width).Render("• /fuzz [scope]         — fuzz-test a function or package"),
-		m.theme.Body().Width(width).Render("• /security-review      — full source security audit"),
-		m.theme.Body().Width(width).Render("• /crash-triage         — triage crash reproducers"),
-		m.theme.Body().Width(width).Render("• /bughunter [scope]    — logic & memory bug hunt"),
+		header,
+		sep,
+		m.theme.CardTipIconFg().Render("  ⚡") + m.theme.CardTipFg().Render(" Bug Finding"),
+		m.theme.Body().Width(width-4).Render("  • /fuzz [scope]         — fuzz-test a function or package"),
+		m.theme.Body().Width(width-4).Render("  • /security-review      — full source security audit"),
+		m.theme.Body().Width(width-4).Render("  • /crash-triage         — triage crash reproducers"),
+		m.theme.Body().Width(width-4).Render("  • /bughunter [scope]    — logic & memory bug hunt"),
 		"",
-		m.theme.Help().Render("/help for all commands  •  F2 activity  •  Tab focus"),
+		m.theme.CardTipIconFg().Render("  ◈") + m.theme.CardTipFg().Render(" General"),
+		m.theme.Body().Width(width-4).Render("  • /help                 — show all commands"),
+		m.theme.Body().Width(width-4).Render("  • /session              — list, switch, fork sessions"),
+		m.theme.Body().Width(width-4).Render("  • /model /provider      — switch model or provider"),
+		"",
+		m.theme.Help().Render("  /help for all commands  •  F2 activity  •  Tab focus"),
 	}
 	if strings.TrimSpace(m.startupNote) != "" {
-		lines = append(lines, "", m.theme.Meta().Render(m.startupNote))
+		lines = append(lines, "", m.theme.Meta().Render("  "+m.startupNote))
 	}
 	return strings.Join(lines, "\n")
 }
@@ -1762,8 +1827,9 @@ func (m model) renderTipsCard(width int) string {
 // renderComposerInner renders the content inside the composer panel:
 // a dimmed CWD line above the textarea input.
 func (m model) renderComposerInner() string {
-	cwd := m.theme.Help().Render(m.cwdShort)
-	return cwd + "\n" + m.input.View()
+	cwd := m.theme.ComposerCwd().Render("⌘ " + m.cwdShort)
+	promptGlyph := m.theme.Accent().Render("› ")
+	return cwd + "\n" + promptGlyph + m.input.View()
 }
 
 // renderCompletion renders the slash-command autocomplete overlay.
@@ -1774,8 +1840,14 @@ func (m model) renderCompletion() string {
 	}
 	const maxVisible = 8
 	nameWidth := 22
-	summaryWidth := max(20, m.width-nameWidth-12)
-	rows := make([]string, 0, maxVisible)
+	summaryWidth := max(20, m.width-nameWidth-16)
+	rows := make([]string, 0, maxVisible+1)
+
+	// Header with count
+	rows = append(rows, m.theme.CardHeader().Width(m.width-6).Render(
+		fmt.Sprintf("  COMMANDS (%d)  ↑↓ navigate  • Enter select", len(m.comp.items))))
+	rows = append(rows, m.theme.CardDivider().Render(strings.Repeat("─", m.width-6)))
+
 	end := min(m.comp.offset+maxVisible, len(m.comp.items))
 	for i := m.comp.offset; i < end; i++ {
 		item := m.comp.items[i]
@@ -1785,18 +1857,32 @@ func (m model) renderCompletion() string {
 			summary = string(runes[:summaryWidth-1]) + "…"
 		}
 		namePad := strings.Repeat(" ", max(0, nameWidth-len(name)))
-		line := name + namePad + "  " + summary
+
+		// Add key hint on right side
+		hint := ""
 		if i == m.comp.cursor {
-			line = m.theme.CompletionSelected().Width(m.width - 6).Render(line)
+			hint = m.theme.Help().Render("  Enter")
+		}
+
+		line := name + namePad + "  " + summary + hint
+		if i == m.comp.cursor {
+			// Shimmer effect on selected row
+			if m.spinFrame%4 < 2 {
+				line = "\033[1m" + m.theme.CompletionSelected().Width(m.width-6).Render(line) + "\033[22m"
+			} else {
+				line = m.theme.CompletionSelected().Width(m.width-6).Render(line)
+			}
 		} else {
-			line = m.theme.CompletionRow().Width(m.width - 6).Render(line)
+			line = m.theme.CompletionRow().Width(m.width-6).Render(line)
 		}
 		rows = append(rows, line)
 	}
+
 	if len(m.comp.items) > maxVisible {
 		scrollInfo := fmt.Sprintf("  %d/%d  ↑↓ navigate", m.comp.cursor+1, len(m.comp.items))
 		rows = append(rows, m.theme.Help().Render(scrollInfo))
 	}
+
 	inner := strings.Join(rows, "\n")
 	return m.theme.CompletionFrame().Width(m.width - 4).Render(inner)
 }
@@ -1865,9 +1951,9 @@ func (m model) renderApprovalScreen() string {
 	approveChip := m.theme.Success().Render("[Y] Approve once")
 	denyChip := m.theme.Err().Render("[N] Deny")
 	body := []string{
-		m.theme.Primary().Render("Approval Required"),
-		m.theme.Meta().Render(fmt.Sprintf("Tool %s wants permission to continue.", m.approval.ToolName)),
-		riskStyle.Render(riskLabel),
+		m.theme.CardHeader().Width(width - 4).Render("  APPROVAL REQUIRED"),
+		m.theme.CardDivider().Render(strings.Repeat("─", width-4)),
+		riskStyle.Bold(true).Render(riskLabel),
 		"",
 		m.theme.Body().Bold(true).Render("Command Preview"),
 		m.panel(commandPreview, width-4, 8, false),
@@ -1900,7 +1986,8 @@ func (m model) renderPlanApprovalScreen(width int) string {
 			open++
 		}
 	}
-	header := m.theme.Primary().Render("Plan Ready")
+	header := m.theme.CardHeader().Width(width - 4).Render("  PLAN READY")
+	divider := m.theme.CardDivider().Render(strings.Repeat("─", width-4))
 	subheader := m.theme.Meta().Render(fmt.Sprintf("%d tasks to implement · %d done", open, done))
 	var taskLines []string
 	for _, t := range tl {
@@ -1924,10 +2011,20 @@ func (m model) renderPlanApprovalScreen(width int) string {
 		taskLines = append(taskLines, icon+" "+text)
 	}
 	taskBox := m.panel(strings.Join(taskLines, "\n"), width-4, min(len(tl)+2, 12), false)
+	// Progress bar for plan approval
+	total := done + open
+	var progressLine string
+	if total > 0 {
+		progressLine = ProgressBar(m.theme, float64(done)/float64(total), width-8)
+	}
 	approveChip := m.theme.Success().Bold(true).Render("[Y] Execute plan")
 	denyChip := m.theme.Err().Render("[N] Adjust / give feedback")
 	hint := m.theme.Help().Render("Y begins implementation immediately · N lets you type feedback · Esc cancels")
-	body := []string{header, subheader, "", taskBox, "", lipgloss.JoinHorizontal(lipgloss.Left, approveChip, "   ", denyChip), "", hint}
+	body := []string{header, divider, subheader, "", taskBox}
+	if progressLine != "" {
+		body = append(body, "", progressLine)
+	}
+	body = append(body, "", lipgloss.JoinHorizontal(lipgloss.Left, approveChip, "   ", denyChip), "", hint)
 	return lipgloss.Place(m.width-4, max(10, m.height-12), lipgloss.Center, lipgloss.Center,
 		m.theme.Modal().Width(width).Render(strings.Join(body, "\n")),
 	)
@@ -1941,6 +2038,20 @@ func (m model) renderSmallTerminal() string {
 		m.theme.Help().Render("Shortcuts: F2 activity • Ctrl+D exit"),
 	}
 	return strings.Join(lines, "\n")
+}
+
+// footerHints returns context-aware keyboard shortcut hints.
+func (m model) footerHints() string {
+	if m.approval != nil {
+		if m.approval.Kind == "plan" {
+			return m.theme.Help().Render("Y execute plan • N adjust/feedback • Esc cancel")
+		}
+		return m.theme.Help().Render("Y approve once • N deny • Esc deny")
+	}
+	if m.busy {
+		return m.theme.Help().Render("Working... • F2 activity • Ctrl+D exit")
+	}
+	return m.theme.Help().Render("Enter send • Up/Down scroll • / autocomplete • Ctrl+J newline • F2 activity • Ctrl+T tasks • Tab focus • Ctrl+D exit")
 }
 
 func (m model) panel(content string, width, height int, focused bool) string {

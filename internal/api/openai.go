@@ -21,6 +21,16 @@ type OpenAICompatClient struct {
 	httpClient *http.Client
 }
 
+type OpenAICompatHTTPError struct {
+	StatusCode int
+	Status     string
+	Body       string
+}
+
+func (e *OpenAICompatHTTPError) Error() string {
+	return fmt.Sprintf("openai-compatible request failed: %s: %s", e.Status, e.Body)
+}
+
 func (c *OpenAICompatClient) ProviderKind() ProviderKind {
 	return c.kind
 }
@@ -58,7 +68,11 @@ func (c *OpenAICompatClient) StreamMessageEvents(ctx context.Context, request Me
 				msg,
 			)
 		}
-		return MessageResponse{}, fmt.Errorf("openai-compatible request failed: %s: %s", response.Status, msg)
+		return MessageResponse{}, &OpenAICompatHTTPError{
+			StatusCode: response.StatusCode,
+			Status:     response.Status,
+			Body:       msg,
+		}
 	}
 	return parseOpenAIStream(response.Body, emit)
 }

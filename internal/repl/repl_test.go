@@ -42,7 +42,7 @@ func TestModelWelcomeStateShowsBranding(t *testing.T) {
 	if !strings.Contains(view, "Welcome back") {
 		t.Fatalf("expected startup hero in view, got %q", view)
 	}
-	if !strings.Contains(view, "Recent Session") || !strings.Contains(view, "Quick Start") {
+	if !strings.Contains(view, "RECENT SESSION") || !strings.Contains(view, "QUICK START") {
 		t.Fatalf("expected startup cards in view, got %q", view)
 	}
 }
@@ -184,7 +184,7 @@ func TestModelApprovalFlow(t *testing.T) {
 		t.Fatalf("expected approval modal")
 	}
 	view := m.View()
-	if !strings.Contains(view, "Approval Required") {
+	if !strings.Contains(view, "APPROVAL REQUIRED") {
 		t.Fatalf("expected approval overlay in view")
 	}
 	if !strings.Contains(view, "Approve once") || !strings.Contains(view, "Risk High") {

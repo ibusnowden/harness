@@ -176,6 +176,9 @@ func (r *liveRuntime) StreamMessage(ctx context.Context, client api.MessageClien
 	for {
 		response, err := client.StreamMessageEvents(ctx, request, request.StreamHandler)
 		if err != nil {
+			if _, ok := parseServedContextLimitError(err); ok {
+				return api.MessageResponse{}, err
+			}
 			if attemptedRecovery {
 				return api.MessageResponse{}, err
 			}
