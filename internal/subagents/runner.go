@@ -9,6 +9,7 @@ import (
 
 	"ascaris/internal/api"
 	"ascaris/internal/config"
+	"ascaris/internal/contextbudget"
 )
 
 type Runner struct {
@@ -100,18 +101,34 @@ func (r Runner) runAssignment(ctx context.Context, assignment Assignment) (Resul
 	}
 	maxTokens := max(256, r.MaxTokens)
 
+	system := subagentSystemPrompt()
+	toolDefs := r.toolDefinitions(allowedTools)
+
 	for iteration := 0; iteration < maxIterations; iteration++ {
+		if compacted, _, triggered := contextbudget.CompactSubagentMessages(messages, system, toolDefs, route.RequestModel, maxTokens); triggered {
+			messages = compacted
+		}
 		request := api.MessageRequest{
 			Model:     route.RequestModel,
 			MaxTokens: maxTokens,
 			Messages:  append([]api.InputMessage(nil), messages...),
-			System:    subagentSystemPrompt(),
-			Tools:     r.toolDefinitions(allowedTools),
+			System:    system,
+			Tools:     toolDefs,
 			Stream:    true,
 		}
 		response, err := client.StreamMessageEvents(ctx, request, nil)
 		if err != nil {
-			return Result{TokenUsage: tokenUsage}, err
+			if _, ok := contextbudget.ParseServedContextLimitError(err); ok {
+				retryMessages, _, retried := contextbudget.CompactSubagentMessages(messages, system, toolDefs, route.RequestModel, maxTokens)
+				if retried {
+					messages = retryMessages
+					request.Messages = append([]api.InputMessage(nil), messages...)
+					response, err = client.StreamMessageEvents(ctx, request, nil)
+				}
+			}
+			if err != nil {
+				return Result{TokenUsage: tokenUsage}, err
+			}
 		}
 		tokenUsage = tokenUsage.Add(response.Usage)
 		messages = append(messages, assistantMessageFromResponse(response))
@@ -136,7 +153,7 @@ func (r Runner) runAssignment(ctx context.Context, assignment Assignment) (Resul
 			result := r.executeTool(ctx, call, iteration+1, allowedTools)
 			envelopes = append(envelopes, api.ToolResultEnvelope{
 				ToolUseID: result.ToolUseID,
-				Output:    result.Output,
+				Output:    api.TruncateToolOutput(result.Output, api.MaxToolOutputChars),
 				IsError:   result.IsError,
 			})
 		}

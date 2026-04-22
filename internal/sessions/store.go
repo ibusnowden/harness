@@ -335,6 +335,17 @@ func (s *ManagedSession) RecordPrompt(text string) {
 	s.touch()
 }
 
+// EstimateTokens returns an approximate token count for the current message
+// history. Uses the shared char/4 heuristic from the api package — it
+// overestimates slightly, which is the safe direction when deciding whether
+// to compact.
+func (s *ManagedSession) EstimateTokens() int {
+	if s == nil {
+		return 0
+	}
+	return api.EstimateMessagesTokens(s.Messages)
+}
+
 func (s *ManagedSession) RecordCompaction(summary string, removed int) {
 	count := 1
 	if s.Meta.Compaction != nil {

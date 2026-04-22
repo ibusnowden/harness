@@ -206,3 +206,79 @@ func subagentJSONString(value string) string {
 	data, _ := json.Marshal(value)
 	return string(data)
 }
+
+func TestRunnerTruncatesHugeToolOutputBeforeNextRequest(t *testing.T) {
+	huge := strings.Repeat("X", 60_000)
+	callCount := 0
+	var secondRequest api.MessageRequest
+	restoreTransport := api.SetTransportForTesting(subagentRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+		callCount++
+		switch callCount {
+		case 1:
+			return subagentSSETextResponse(subagentToolUseSSE("toolu_read", "read_file", `{"path":"big.txt"}`)), nil
+		case 2:
+			data, err := io.ReadAll(req.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			if err := json.Unmarshal(data, &secondRequest); err != nil {
+				t.Fatalf("decode body: %v", err)
+			}
+			return subagentSSETextResponse(subagentFinalTextSSE(`{"summary":"ok","verification":"done","blockers":[]}`)), nil
+		default:
+			t.Fatalf("unexpected HTTP call %d", callCount)
+			return nil, nil
+		}
+	}))
+	defer restoreTransport()
+
+	root := t.TempDir()
+	configHome := filepath.Join(t.TempDir(), ".ascaris")
+	t.Setenv("ANTHROPIC_API_KEY", "test-key")
+	t.Setenv("ANTHROPIC_BASE_URL", "https://mock.anthropic.local")
+	t.Setenv("ASCARIS_CONFIG_HOME", configHome)
+
+	registry := NewRegistry()
+	assignment, err := registry.Create("worker-1", "explorer", "inspect huge", "read only", []string{"read_file"}, []string{"Read big.txt"})
+	if err != nil {
+		t.Fatalf("create assignment: %v", err)
+	}
+	if err := SaveRegistry(root, registry); err != nil {
+		t.Fatalf("save registry: %v", err)
+	}
+
+	runner := Runner{
+		Root:          root,
+		Config:        config.Empty(),
+		Model:         "sonnet",
+		MaxIterations: 4,
+		ExecuteTool: func(_ context.Context, call ToolCall, _ int, _ []string) ToolResult {
+			return ToolResult{ToolUseID: call.ID, Name: call.Name, Output: huge}
+		},
+	}
+	if _, err := runner.Run(context.Background(), assignment); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("expected 2 HTTP calls, got %d", callCount)
+	}
+	// The tool_result content in the second request must never carry the
+	// full 60k payload — it is capped at MaxToolOutputChars + elision marker.
+	foundToolResult := false
+	for _, msg := range secondRequest.Messages {
+		for _, block := range msg.Content {
+			if block.Type != "tool_result" {
+				continue
+			}
+			for _, item := range block.Content {
+				foundToolResult = true
+				if len(item.Text) > api.MaxToolOutputChars+256 {
+					t.Fatalf("tool_result not truncated: len=%d cap=%d", len(item.Text), api.MaxToolOutputChars)
+				}
+			}
+		}
+	}
+	if !foundToolResult {
+		t.Fatalf("expected a tool_result block in the second request, got %#v", secondRequest.Messages)
+	}
+}

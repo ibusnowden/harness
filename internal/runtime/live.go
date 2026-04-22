@@ -4,17 +4,16 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
 
 	"ascaris/internal/api"
 	"ascaris/internal/config"
+	"ascaris/internal/contextbudget"
 	"ascaris/internal/promptcache"
 	"ascaris/internal/sessions"
 	"ascaris/internal/tools"
@@ -348,7 +347,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 				})
 				envelopes = append(envelopes, api.ToolResultEnvelope{
 					ToolUseID: result.ToolUseID,
-					Output:    result.Output,
+					Output:    api.TruncateToolOutput(result.Output, api.MaxToolOutputChars),
 					IsError:   true,
 				})
 				continue
@@ -376,7 +375,7 @@ func (h LiveHarness) RunPrompt(ctx context.Context, prompt string, opts PromptOp
 			})
 			envelopes = append(envelopes, api.ToolResultEnvelope{
 				ToolUseID: result.ToolUseID,
-				Output:    result.Output,
+				Output:    api.TruncateToolOutput(result.Output, api.MaxToolOutputChars),
 				IsError:   result.IsError,
 			})
 		}
@@ -828,9 +827,9 @@ func contextAwareMaxTokensWithWindow(request api.MessageRequest, requested int, 
 	if contextWindow <= 0 {
 		return desired
 	}
-	estimatedInput := estimateRequestInputTokens(request)
+	estimatedInput := api.EstimateRequestInputTokens(request)
 	if observed.InputTokens > 0 && observed.MessageCount >= 0 && observed.MessageCount <= len(request.Messages) {
-		estimatedInput = max(estimatedInput, observed.InputTokens+estimateMessagesInputTokens(request.Messages[observed.MessageCount:]))
+		estimatedInput = max(estimatedInput, observed.InputTokens+api.EstimateMessagesTokens(request.Messages[observed.MessageCount:]))
 	}
 	remaining := contextWindow - estimatedInput - contextBudgetSafetyTokens(contextWindow)
 	switch {
@@ -844,89 +843,16 @@ func contextAwareMaxTokensWithWindow(request api.MessageRequest, requested int, 
 }
 
 func modelContextWindow(model string) int {
-	normalized := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case normalized == "qwen3.6-30b-a3b", strings.Contains(normalized, "qwen3.6-35b-a3b"):
-		return 262144
-	case normalized == "glm-4.7-flash":
-		return 32768
-	default:
-		return 0
-	}
+	return contextbudget.ModelContextWindow(model)
 }
 
 func contextBudgetSafetyTokens(contextWindow int) int {
-	return max(384, contextWindow/24)
+	return contextbudget.SafetyTokens(contextWindow)
 }
 
-func estimateRequestInputTokens(request api.MessageRequest) int {
-	total := estimateSystemTokenCount(request.System) + 24
-	total += estimateMessagesInputTokens(request.Messages)
-	total += estimateToolsInputTokens(request.Tools)
-	if request.ToolChoice != nil {
-		total += 16
-		total += estimateTokenCount(request.ToolChoice.Type)
-		total += estimateTokenCount(request.ToolChoice.Name)
-	}
-	return max(1, total)
-}
-
-func estimateMessagesInputTokens(messages []api.InputMessage) int {
-	total := 0
-	for _, message := range messages {
-		total += 12
-		total += estimateTokenCount(message.Role)
-		for _, block := range message.Content {
-			total += 8
-			total += estimateTokenCount(block.Type)
-			total += estimateTokenCount(block.Text)
-			total += estimateTokenCount(block.ID)
-			total += estimateTokenCount(block.Name)
-			total += estimateTokenCount(block.ToolUseID)
-			total += estimateRawJSONTokens(block.Input)
-			for _, item := range block.Content {
-				total += 4
-				total += estimateTokenCount(item.Type)
-				total += estimateTokenCount(item.Text)
-				total += estimateRawJSONTokens(item.Value)
-			}
-		}
-	}
-	return total
-}
-
-func estimateToolsInputTokens(tools []api.ToolDefinition) int {
-	total := 0
-	for _, tool := range tools {
-		total += 24
-		total += estimateTokenCount(tool.Name)
-		total += estimateSystemTokenCount(tool.Description)
-		total += estimateRawJSONTokens(tool.InputSchema)
-	}
-	return total
-}
-
-func estimateSystemTokenCount(text string) int {
-	return estimateTokenCountWithDivisor(text, 5)
-}
-
-func estimateTokenCount(text string) int {
-	return estimateTokenCountWithDivisor(text, 4)
-}
-
-func estimateTokenCountWithDivisor(text string, divisor int) int {
-	if strings.TrimSpace(text) == "" {
-		return 0
-	}
-	return (len(text) + divisor - 1) / divisor
-}
-
-func estimateRawJSONTokens(raw json.RawMessage) int {
-	if len(raw) == 0 {
-		return 0
-	}
-	return (len(raw) + 3) / 4
-}
+// Token estimators now live in the api package (internal/api/tokens.go) so
+// that non-runtime callers (sessions, subagents, contextbudget) can reach
+// them without importing runtime.
 
 const (
 	contextCompactionNoticePrefix  = "[Ascaris context compaction]"
@@ -1113,7 +1039,7 @@ func applyContextWindowCompactionWithLimit(session *sessions.ManagedSession, req
 		return nil
 	}
 	budget := contextWindowInputBudgetForLimit(contextWindow, minResponseTokens)
-	if budget <= 0 || estimateRequestInputTokens(*request) <= budget {
+	if budget <= 0 || api.EstimateRequestInputTokens(*request) <= budget {
 		return nil
 	}
 	originalMessages := append([]api.InputMessage(nil), session.Messages...)
@@ -1130,7 +1056,7 @@ func applyContextWindowCompactionWithLimit(session *sessions.ManagedSession, req
 		}
 		candidateRequest := *request
 		candidateRequest.Messages = candidate
-		if estimateRequestInputTokens(candidateRequest) > budget {
+		if api.EstimateRequestInputTokens(candidateRequest) > budget {
 			continue
 		}
 		removed := len(originalMessages) - (len(baseMessages) - start)
@@ -1153,62 +1079,20 @@ func contextWindowInputBudget(model string, minResponseTokens int) int {
 }
 
 func contextWindowInputBudgetForLimit(contextWindow, minResponseTokens int) int {
-	if contextWindow <= 0 {
-		return 0
-	}
-	return contextWindow - contextBudgetSafetyTokens(contextWindow) - minContextResponseTokens(minResponseTokens)
+	return contextbudget.InputBudget(contextWindow, minResponseTokens)
 }
 
 func minContextResponseTokens(requested int) int {
-	if requested <= 0 {
-		return 512
-	}
-	return min(512, max(128, requested))
+	return contextbudget.MinResponseTokens(requested)
 }
 
-type servedContextLimit struct {
-	ContextWindow int
-	InputTokens   int
-}
-
-var (
-	maximumContextLengthRE = regexp.MustCompile(`(?i)maximum context length is\s+([0-9,]+)`)
-	promptInputTokensRE    = regexp.MustCompile(`(?i)prompt contains at least\s+([0-9,]+)\s+input tokens`)
-	inputTokensValueRE     = regexp.MustCompile(`(?i)"value"\s*:\s*([0-9,]+)`)
-)
+// servedContextLimit is aliased to the shared contextbudget type so the live
+// runtime and the subagent runner speak the same vocabulary about a
+// vLLM-reported overflow.
+type servedContextLimit = contextbudget.ServedContextLimit
 
 func parseServedContextLimitError(err error) (servedContextLimit, bool) {
-	if err == nil {
-		return servedContextLimit{}, false
-	}
-	text := err.Error()
-	var httpErr *api.OpenAICompatHTTPError
-	if errors.As(err, &httpErr) {
-		text = strings.TrimSpace(httpErr.Body + "\n" + httpErr.Error())
-	}
-	if !strings.Contains(strings.ToLower(text), "maximum context length") {
-		return servedContextLimit{}, false
-	}
-	limit := servedContextLimit{
-		ContextWindow: firstRegexInt(maximumContextLengthRE, text),
-		InputTokens:   firstRegexInt(promptInputTokensRE, text),
-	}
-	if limit.InputTokens == 0 && strings.Contains(text, `"input_tokens"`) {
-		limit.InputTokens = firstRegexInt(inputTokensValueRE, text)
-	}
-	return limit, limit.ContextWindow > 0
-}
-
-func firstRegexInt(pattern *regexp.Regexp, text string) int {
-	matches := pattern.FindStringSubmatch(text)
-	if len(matches) < 2 {
-		return 0
-	}
-	value, err := strconv.Atoi(strings.ReplaceAll(matches[1], ",", ""))
-	if err != nil {
-		return 0
-	}
-	return value
+	return contextbudget.ParseServedContextLimitError(err)
 }
 
 func prepareContextLimitRetry(session *sessions.ManagedSession, request *api.MessageRequest, activePrompt string, requestedMaxTokens int, observed requestTokenObservation, limit servedContextLimit) (*AutoCompaction, bool) {
@@ -1235,7 +1119,7 @@ func contextLimitRecoveryError(err error, limit servedContextLimit, request api.
 		"%w\n\nAscaris could not fit this request into the served context window (%d tokens). Estimated current request input is %d tokens. Run /compact, start a fresh session, reduce pasted/tool output, or restart vLLM with a larger --max-model-len.",
 		err,
 		limit.ContextWindow,
-		estimateRequestInputTokens(request),
+		api.EstimateRequestInputTokens(request),
 	)
 }
 
@@ -1395,13 +1279,7 @@ func compactJSONValueForContext(value any, maxChars int) any {
 }
 
 func truncateMiddle(value string, maxChars int) string {
-	if maxChars <= 0 || len(value) <= maxChars {
-		return value
-	}
-	omitted := len(value) - maxChars
-	head := maxChars / 2
-	tail := maxChars - head
-	return value[:head] + fmt.Sprintf("\n... [truncated %d chars] ...\n", omitted) + value[len(value)-tail:]
+	return api.TruncateMiddle(value, maxChars)
 }
 
 func mergeAutoCompactions(existing, next *AutoCompaction) *AutoCompaction {
@@ -1421,15 +1299,20 @@ func effectiveAutoCompactThreshold(opts PromptOptions) int {
 	if opts.AutoCompactInputTokens > 0 {
 		return opts.AutoCompactInputTokens
 	}
-	value := strings.TrimSpace(os.Getenv("ASCARIS_AUTO_COMPACT_INPUT_TOKENS"))
-	if value == "" {
-		return 0
+	if value := strings.TrimSpace(os.Getenv("ASCARIS_AUTO_COMPACT_INPUT_TOKENS")); value != "" {
+		if threshold, err := strconv.Atoi(value); err == nil && threshold > 0 {
+			return threshold
+		}
 	}
-	threshold, err := strconv.Atoi(value)
-	if err != nil {
-		return 0
+	// Default to ~75% of the model's advertised context window so the
+	// semantic-summary path fires well before budget-driven compaction or a
+	// 400 retry would be needed. For unknown models (window == 0) we stay
+	// disabled — the server may enforce a different ceiling and we would
+	// rather leave the session untouched than guess.
+	if window := modelContextWindow(opts.Model); window > 0 {
+		return window * 3 / 4
 	}
-	return threshold
+	return 0
 }
 
 func compactJSON(raw json.RawMessage) string {

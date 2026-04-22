@@ -73,3 +73,25 @@ func TestForkDeleteAndExportSession(t *testing.T) {
 		t.Fatalf("unexpected sessions after delete: %#v", items)
 	}
 }
+
+func TestManagedSessionEstimateTokens(t *testing.T) {
+	session := NewManagedSession("est", "qwen3.6-30b-a3b")
+	if got := session.EstimateTokens(); got != 0 {
+		t.Fatalf("expected 0 tokens for empty session, got %d", got)
+	}
+	session.Messages = append(session.Messages, api.UserTextMessage("hello"))
+	after := session.EstimateTokens()
+	if after <= 0 {
+		t.Fatalf("expected positive estimate after append, got %d", after)
+	}
+	session.Messages = append(session.Messages, api.UserTextMessage(strings.Repeat("x", 1000)))
+	larger := session.EstimateTokens()
+	if larger <= after {
+		t.Fatalf("expected monotonic growth, prev=%d after=%d", after, larger)
+	}
+
+	var nilSession *ManagedSession
+	if got := nilSession.EstimateTokens(); got != 0 {
+		t.Fatalf("expected 0 for nil receiver, got %d", got)
+	}
+}

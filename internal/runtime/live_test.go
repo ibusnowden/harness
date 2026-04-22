@@ -504,7 +504,7 @@ func TestContextWindowCompactionKeepsValidToolHistory(t *testing.T) {
 	if !validToolHistory(session.Messages) {
 		t.Fatalf("compacted messages contain dangling tool results: %#v", session.Messages)
 	}
-	if got := estimateRequestInputTokens(request); got > contextWindowInputBudget(request.Model, 512) {
+	if got := api.EstimateRequestInputTokens(request); got > contextWindowInputBudget(request.Model, 512) {
 		t.Fatalf("compacted request still exceeds budget: got=%d budget=%d", got, contextWindowInputBudget(request.Model, 512))
 	}
 }
@@ -747,4 +747,57 @@ func openAITextSSEForTest(text string) string {
 		`data: [DONE]`,
 		"",
 	}, "\n")
+}
+
+func TestEffectiveAutoCompactThreshold_DefaultsToFractionOfWindow(t *testing.T) {
+	t.Setenv("ASCARIS_AUTO_COMPACT_INPUT_TOKENS", "")
+	got := effectiveAutoCompactThreshold(PromptOptions{Model: "qwen3.6-30b-a3b"})
+	if want := 262144 * 3 / 4; got != want {
+		t.Fatalf("expected default threshold %d for qwen, got %d", want, got)
+	}
+	if got := effectiveAutoCompactThreshold(PromptOptions{Model: "unknown-model"}); got != 0 {
+		t.Fatalf("expected 0 for unknown model, got %d", got)
+	}
+}
+
+func TestEffectiveAutoCompactThreshold_ExplicitOptionWins(t *testing.T) {
+	t.Setenv("ASCARIS_AUTO_COMPACT_INPUT_TOKENS", "99999")
+	got := effectiveAutoCompactThreshold(PromptOptions{Model: "qwen3.6-30b-a3b", AutoCompactInputTokens: 1234})
+	if got != 1234 {
+		t.Fatalf("explicit option should win, got %d", got)
+	}
+}
+
+func TestEffectiveAutoCompactThreshold_EnvOverridesDefault(t *testing.T) {
+	t.Setenv("ASCARIS_AUTO_COMPACT_INPUT_TOKENS", "50000")
+	got := effectiveAutoCompactThreshold(PromptOptions{Model: "qwen3.6-30b-a3b"})
+	if got != 50000 {
+		t.Fatalf("env should override default, got %d", got)
+	}
+}
+
+func TestToolResultEnvelopeTruncatesHugeOutput(t *testing.T) {
+	// Unit-level check that the live/subagent wiring caps tool output before
+	// it enters message history. Both call sites use the same
+	// api.TruncateToolOutput wrapper, so we assert the wrapper's behavior
+	// end-to-end through ToolResultMessage.
+	huge := strings.Repeat("A", 50_000)
+	envelope := api.ToolResultEnvelope{
+		ToolUseID: "toolu_read",
+		Output:    api.TruncateToolOutput(huge, api.MaxToolOutputChars),
+		IsError:   false,
+	}
+	msg := api.ToolResultMessage([]api.ToolResultEnvelope{envelope})
+	if len(msg.Content) != 1 {
+		t.Fatalf("expected one content block, got %d", len(msg.Content))
+	}
+	if n := len(msg.Content[0].Content); n != 1 {
+		t.Fatalf("expected one tool_result content item, got %d", n)
+	}
+	if got := len(msg.Content[0].Content[0].Text); got > api.MaxToolOutputChars+256 {
+		t.Fatalf("tool_result text not truncated: len=%d cap=%d", got, api.MaxToolOutputChars)
+	}
+	if !strings.Contains(msg.Content[0].Content[0].Text, "truncated") {
+		t.Fatalf("expected truncation marker in compacted tool_result text")
+	}
 }
